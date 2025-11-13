@@ -17,6 +17,8 @@ func newVersionCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print CLI version information",
+		Example: `  # Print the CLI version
+  ocp version`,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(cmd.OutOrStdout(), "ocp version %s (commit %s)\n", Version, Commit)
 		},

@@ -50,6 +50,11 @@ Examples:
   # With identity file
   ocp ssh -i ~/.ssh/id_rsa master-1 "whoami" "df -h" "free -m"`,
 		Args: cobra.MinimumNArgs(1),
+		Example: `  # Open an interactive session
+  ocp ssh worker-1
+
+  # Run multiple commands sequentially
+  ocp ssh master-0 "whoami" "cat /etc/os-release"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 

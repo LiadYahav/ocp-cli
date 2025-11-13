@@ -48,6 +48,8 @@ func newNodeListCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List nodes in the cluster",
+		Example: `  # List all nodes
+  ocp node list`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -78,6 +80,8 @@ func newNodeInfoCommand() *cobra.Command {
 		Use:   "info",
 		Short: "Display detailed information about all nodes",
 		Long:  `Display a table with detailed information about all nodes including status, roles, IPs, versions, and system info.`,
+		Example: `  # Show a wide table of node details
+  ocp node info`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -211,6 +215,8 @@ func newNodeDescribeCommand() *cobra.Command {
 		Use:   "describe <node-pattern>",
 		Short: "Show detailed information about a node",
 		Args:  cobra.ExactArgs(1),
+		Example: `  # Describe a specific node
+  ocp node describe master-0`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 
@@ -310,6 +316,8 @@ func newNodeYamlCommand() *cobra.Command {
 		Use:   "yaml <node-pattern>",
 		Short: "Display node information in YAML format",
 		Args:  cobra.ExactArgs(1),
+		Example: `  # Output the node definition in YAML
+  ocp node yaml worker-1`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 
@@ -354,6 +362,11 @@ func newNodeRebootCommand() *cobra.Command {
 		Use:   "reboot <node-pattern>",
 		Short: "Reboot a node via SSH",
 		Args:  cobra.ExactArgs(1),
+		Example: `  # Reboot a specific node
+  ocp node reboot worker-2
+
+  # Reboot nodes that match a regex
+  ocp node reboot '^worker-.*'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 			return runSSHCommand(cmd.Context(), user, identityFile, pattern, []string{"sudo reboot"}, cmd)
@@ -371,6 +384,8 @@ func newNodeCordonCommand() *cobra.Command {
 		Use:   "cordon <node-pattern>",
 		Short: "Mark node as unschedulable",
 		Args:  cobra.ExactArgs(1),
+		Example: `  # Prevent new pods from scheduling on a node
+  ocp node cordon master-0`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 
@@ -408,6 +423,9 @@ func newNodeDrainCommand() *cobra.Command {
 		Long: `Drain a node by marking it as unschedulable and evicting all pods.
 The node must have the annotation "node.dana.io/reason: Maintenance" before draining.`,
 		Args: cobra.ExactArgs(1),
+		Example: `  # Drain a node after adding the maintenance annotation
+  ocp node annotate worker-3 node.dana.io/reason=Maintenance
+  ocp node drain worker-3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 
@@ -489,6 +507,8 @@ func newNodeUncordonCommand() *cobra.Command {
 		Short: "Mark node as schedulable and remove maintenance annotation",
 		Long:  `Mark a node as schedulable and remove the "node.dana.io/reason" annotation if present.`,
 		Args:  cobra.ExactArgs(1),
+		Example: `  # Remove the maintenance annotation and allow scheduling
+  ocp node uncordon worker-3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 
@@ -546,6 +566,11 @@ Examples:
   ocp node annotate node-24 node.dana.io/reason=Maintenance
   ocp node annotate node-24 node.dana.io/reason`,
 		Args: cobra.ExactArgs(2),
+		Example: `  # Add an annotation
+  ocp node annotate worker-2 purpose=maintenance
+
+  # Remove an annotation
+  ocp node annotate worker-2 purpose`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 			annotation := args[1]
@@ -627,6 +652,11 @@ Examples:
   ocp node label node-24 environment=production
   ocp node label node-24 environment-`,
 		Args: cobra.ExactArgs(2),
+		Example: `  # Add or update a label
+  ocp node label worker-1 zone=us-east-1a
+
+  # Remove a label
+  ocp node label worker-1 zone-`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 			label := args[1]

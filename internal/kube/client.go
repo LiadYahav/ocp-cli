@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -40,15 +41,22 @@ func configPathFromContext(ctx context.Context) string {
 // NewClientset returns a client-go Clientset either using in-cluster configuration
 // or the user's local kubeconfig.
 func NewClientset(ctx context.Context) (*kubernetes.Clientset, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, err := restConfig(ctx)
 	if err != nil {
-		cfg, err = loadKubeConfig(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create Kubernetes config: %w", err)
-		}
+		return nil, err
 	}
 
 	return kubernetes.NewForConfig(cfg)
+}
+
+// NewDynamicClient returns a dynamic Kubernetes client using the same auth resolution as NewClientset.
+func NewDynamicClient(ctx context.Context) (dynamic.Interface, error) {
+	cfg, err := restConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return dynamic.NewForConfig(cfg)
 }
 
 func loadKubeConfig(ctx context.Context) (*rest.Config, error) {
@@ -59,6 +67,20 @@ func loadKubeConfig(ctx context.Context) (*rest.Config, error) {
 
 	configOverrides := &clientcmd.ConfigOverrides{}
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).ClientConfig()
+}
+
+func restConfig(ctx context.Context) (*rest.Config, error) {
+	cfg, err := rest.InClusterConfig()
+	if err == nil {
+		return cfg, nil
+	}
+
+	cfg, err = loadKubeConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create Kubernetes config: %w", err)
+	}
+
+	return cfg, nil
 }
 
 // GetCurrentContext returns the current context name and cluster name from kubeconfig

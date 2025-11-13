@@ -3,9 +3,14 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	unstructuredhelpers "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/liadyahav/ocp-cli/internal/kube"
 )
@@ -75,6 +80,12 @@ func newClusterInfoCommand() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "  Namespaces: %d\n", len(namespaces.Items))
 			fmt.Fprintf(cmd.OutOrStdout(), "  Pods:       %d\n", len(pods.Items))
 
+			if consoleURL, err := getConsoleURL(ctx); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: failed to fetch console route: %v\n", err)
+			} else if consoleURL != "" {
+				fmt.Fprintf(cmd.OutOrStdout(), "  Console:    %s\n", consoleURL)
+			}
+
 			return nil
 		},
 	}
@@ -107,4 +118,45 @@ func newClusterVersionCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func getConsoleURL(ctx context.Context) (string, error) {
+	dynamicClient, err := kube.NewDynamicClient(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	gvr := schema.GroupVersionResource{
+		Group:    "route.openshift.io",
+		Version:  "v1",
+		Resource: "routes",
+	}
+
+	route, err := dynamicClient.Resource(gvr).Namespace("openshift-console").Get(ctx, "console", metav1.GetOptions{})
+	if meta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+
+	host, found, _ := unstructuredhelpers.NestedString(route.Object, "spec", "host")
+	if !found || host == "" {
+		if ingress, found, _ := unstructuredhelpers.NestedSlice(route.Object, "status", "ingress"); found {
+			for _, entry := range ingress {
+				if m, ok := entry.(map[string]interface{}); ok {
+					if candidate, ok := m["host"].(string); ok && candidate != "" {
+						host = candidate
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if host == "" {
+		return "", nil
+	}
+
+	return fmt.Sprintf("https://%s/", strings.TrimSuffix(host, "/")), nil
 }

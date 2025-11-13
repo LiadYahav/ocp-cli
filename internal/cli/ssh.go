@@ -53,54 +53,7 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 
-			ctx := cmd.Context()
-			if ctx == nil {
-				ctx = context.Background()
-			}
-
-			ip, err := resolveNodeIP(ctx, pattern)
-			if err != nil {
-				return err
-			}
-
-			// Resolve identity file: use provided flag, or default if it exists
-			resolvedIdentityFile := identityFile
-			if resolvedIdentityFile == "" {
-				defaultKey, err := expandPath(defaultSSHKeyPath)
-				if err == nil {
-					if _, err := os.Stat(defaultKey); err == nil {
-						resolvedIdentityFile = defaultKey
-					}
-				}
-			}
-
-			// Validate identity file if set
-			if resolvedIdentityFile != "" {
-				if _, err := os.Stat(resolvedIdentityFile); os.IsNotExist(err) {
-					return fmt.Errorf("identity file %q does not exist", resolvedIdentityFile)
-				}
-			}
-
-			target := fmt.Sprintf("%s@%s", user, ip)
-			sshArgs := []string{}
-
-			if resolvedIdentityFile != "" {
-				sshArgs = append(sshArgs, "-i", resolvedIdentityFile)
-			}
-
-			sshArgs = append(sshArgs, target)
-			if len(args) > 1 {
-				// Join multiple commands with "; "
-				combinedCmd := strings.Join(args[1:], "; ")
-				sshArgs = append(sshArgs, combinedCmd)
-			}
-
-			sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
-			sshCmd.Stdin = cmd.InOrStdin()
-			sshCmd.Stdout = cmd.OutOrStdout()
-			sshCmd.Stderr = cmd.ErrOrStderr()
-
-			return sshCmd.Run()
+			return runSSHCommand(cmd.Context(), user, identityFile, pattern, args[1:], cmd)
 		},
 	}
 
@@ -203,4 +156,62 @@ func findNodeIP(addresses []corev1.NodeAddress) string {
 	}
 
 	return external
+}
+
+func runSSHCommand(ctx context.Context, user, identityFile, pattern string, commands []string, cobraCmd *cobra.Command) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	ip, err := resolveNodeIP(ctx, pattern)
+	if err != nil {
+		return err
+	}
+
+	resolvedIdentityFile, err := resolveIdentityFile(identityFile)
+	if err != nil {
+		return err
+	}
+
+	target := fmt.Sprintf("%s@%s", user, ip)
+	sshArgs := []string{}
+
+	if resolvedIdentityFile != "" {
+		sshArgs = append(sshArgs, "-i", resolvedIdentityFile)
+	}
+
+	sshArgs = append(sshArgs, target)
+	if len(commands) > 0 {
+		combinedCmd := strings.Join(commands, "; ")
+		sshArgs = append(sshArgs, combinedCmd)
+	}
+
+	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
+	if cobraCmd != nil {
+		sshCmd.Stdin = cobraCmd.InOrStdin()
+		sshCmd.Stdout = cobraCmd.OutOrStdout()
+		sshCmd.Stderr = cobraCmd.ErrOrStderr()
+	}
+
+	return sshCmd.Run()
+}
+
+func resolveIdentityFile(identityFile string) (string, error) {
+	resolvedIdentityFile := identityFile
+	if resolvedIdentityFile == "" {
+		defaultKey, err := expandPath(defaultSSHKeyPath)
+		if err == nil {
+			if _, err := os.Stat(defaultKey); err == nil {
+				resolvedIdentityFile = defaultKey
+			}
+		}
+	}
+
+	if resolvedIdentityFile != "" {
+		if _, err := os.Stat(resolvedIdentityFile); os.IsNotExist(err) {
+			return "", fmt.Errorf("identity file %q does not exist", resolvedIdentityFile)
+		}
+	}
+
+	return resolvedIdentityFile, nil
 }

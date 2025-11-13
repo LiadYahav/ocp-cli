@@ -33,6 +33,7 @@ func newNodeCommand() *cobra.Command {
 		newNodeInfoCommand(),
 		newNodeDescribeCommand(),
 		newNodeYamlCommand(),
+		newNodeRebootCommand(),
 		newNodeCordonCommand(),
 		newNodeDrainCommand(),
 		newNodeUncordonCommand(),
@@ -343,6 +344,26 @@ func newNodeYamlCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newNodeRebootCommand() *cobra.Command {
+	var user string
+	var identityFile string
+
+	cmd := &cobra.Command{
+		Use:   "reboot <node-pattern>",
+		Short: "Reboot a node via SSH",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			pattern := args[0]
+			return runSSHCommand(cmd.Context(), user, identityFile, pattern, []string{"sudo reboot"}, cmd)
+		},
+	}
+
+	cmd.Flags().StringVarP(&user, "user", "u", "core", "Username for SSH connection")
+	cmd.Flags().StringVarP(&identityFile, "identity", "i", "", "Path to private key file for SSH authentication (default: ~/.ssh/id_rsa_ocp if exists)")
+
+	return cmd
 }
 
 func newNodeCordonCommand() *cobra.Command {

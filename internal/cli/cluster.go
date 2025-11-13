@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -29,6 +30,7 @@ Examples:
 	cmd.AddCommand(
 		newClusterInfoCommand(),
 		newClusterVersionCommand(),
+		newClusterWatchCommand(),
 	)
 
 	return cmd
@@ -116,6 +118,26 @@ func newClusterVersionCommand() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "Build Date:         %s\n", version.BuildDate)
 
 			return nil
+		},
+	}
+}
+
+func newClusterWatchCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "watch",
+		Short: "Watch cluster operators, clusterversion, and machineconfigpools",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			watchCmd := exec.CommandContext(ctx, "watch", "-n", "1", "-d", "sh", "-c", "oc get co,clusterversion,mcp")
+			watchCmd.Stdin = cmd.InOrStdin()
+			watchCmd.Stdout = cmd.OutOrStdout()
+			watchCmd.Stderr = cmd.ErrOrStderr()
+
+			return watchCmd.Run()
 		},
 	}
 }

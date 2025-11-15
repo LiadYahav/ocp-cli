@@ -62,6 +62,7 @@ func (c *CLI) configure() {
 		newClusterCommand(),
 		newNodeCommand(),
 		newMCPCommand(),
+		newBindingCommand(),
 		newVersionCommand(),
 		newCompletionCommand(c.root),
 	)

@@ -82,7 +82,7 @@ func completeMCPNames(cmd *cobra.Command, args []string, toComplete string) ([]s
 
 // completeMCPActions returns the available actions for MCP command
 func completeMCPActions(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	actions := []string{"resume", "stop"}
+	actions := []string{"resume", "pause"}
 	completions := make([]string, 0, len(actions))
 	for _, action := range actions {
 		if strings.HasPrefix(action, toComplete) {

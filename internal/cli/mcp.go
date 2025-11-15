@@ -18,7 +18,7 @@ import (
 
 func newMCPCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "mcp <mcp-name> <resume|stop>",
+		Use:   "mcp <mcp-name> <resume|pause>",
 		Short: "Manage Machine Config Pools",
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			// Complete MCP names for the first argument
@@ -32,17 +32,17 @@ func newMCPCommand() *cobra.Command {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		},
 		Long: `Manage Machine Config Pools (MCP) in OpenShift.
-Use 'resume' to unpause an MCP (sets paused: false) or 'stop' to pause an MCP (sets paused: true).
+Use 'resume' to unpause an MCP (sets paused: false) or 'pause' to pause an MCP (sets paused: true).
 
 Examples:
   ocp mcp worker resume
-  ocp mcp master stop`,
+  ocp mcp master pause`,
 		Args: cobra.ExactArgs(2),
 		Example: `  # Resume (unpause) the worker Machine Config Pool
   ocp mcp worker resume
 
-  # Stop (pause) the master Machine Config Pool
-  ocp mcp master stop`,
+  # Pause the master Machine Config Pool
+  ocp mcp master pause`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mcpName := args[0]
 			action := args[1]
@@ -51,10 +51,10 @@ Examples:
 			switch action {
 			case "resume":
 				paused = false
-			case "stop":
+			case "pause":
 				paused = true
 			default:
-				return fmt.Errorf("invalid action %q: must be 'resume' or 'stop'", action)
+				return fmt.Errorf("invalid action %q: must be 'resume' or 'pause'", action)
 			}
 
 			return setMCPPaused(cmd.Context(), mcpName, paused, cmd.OutOrStdout())
@@ -113,7 +113,7 @@ func setMCPPaused(ctx context.Context, mcpName string, paused bool, out io.Write
 
 	action := "resumed"
 	if paused {
-		action = "stopped (paused)"
+		action = "paused"
 	}
 
 	fmt.Fprintf(out, "Successfully %s Machine Config Pool %q\n", action, mcpName)

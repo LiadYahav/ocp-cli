@@ -53,7 +53,14 @@ func (c *CLI) configure() {
 			ctx = context.Background()
 		}
 
-		cmd.SetContext(kube.WithConfigPath(ctx, resolvedConfig))
+		ctx = kube.WithConfigPath(ctx, resolvedConfig)
+
+		// Load project namespace from file and add to context
+		if projectNS := getProjectNamespace(); projectNS != "" {
+			ctx = kube.WithProjectNamespace(ctx, projectNS)
+		}
+
+		cmd.SetContext(ctx)
 		return nil
 	}
 
@@ -63,6 +70,7 @@ func (c *CLI) configure() {
 		newNodeCommand(),
 		newMCPCommand(),
 		newBindingCommand(),
+		newProjectCommand(),
 		newVersionCommand(),
 		newCompletionCommand(c.root),
 	)

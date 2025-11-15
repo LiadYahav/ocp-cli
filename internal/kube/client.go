@@ -11,6 +11,7 @@ import (
 )
 
 type configPathKey struct{}
+type projectNamespaceKey struct{}
 
 // WithConfigPath returns a context that carries an explicit kubeconfig path.
 // When path is empty, the context is returned unchanged.
@@ -32,6 +33,33 @@ func configPathFromContext(ctx context.Context) string {
 	}
 
 	if v, ok := ctx.Value(configPathKey{}).(string); ok {
+		return v
+	}
+
+	return ""
+}
+
+// WithProjectNamespace returns a context that carries an explicit project namespace.
+// When namespace is empty, the context is returned unchanged.
+func WithProjectNamespace(ctx context.Context, namespace string) context.Context {
+	if namespace == "" {
+		return ctx
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	return context.WithValue(ctx, projectNamespaceKey{}, namespace)
+}
+
+// ProjectNamespaceFromContext returns the project namespace from context, if set.
+func ProjectNamespaceFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+
+	if v, ok := ctx.Value(projectNamespaceKey{}).(string); ok {
 		return v
 	}
 

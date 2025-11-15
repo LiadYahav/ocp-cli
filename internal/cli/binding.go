@@ -92,7 +92,7 @@ Use --role to filter by role name.`,
 				if namespace == "" {
 					namespace = getCurrentNamespace(ctx)
 					if namespace == "" {
-						return fmt.Errorf("namespace is required for role bindings. Use --namespace or set current namespace")
+						return fmt.Errorf("namespace is required for role bindings. Use --namespace or set current project with 'ocp project <namespace>'")
 					}
 				}
 				return listRoleBindings(ctx, clientset, namespace, roleName, cmd.OutOrStdout())
@@ -101,7 +101,7 @@ Use --role to filter by role name.`,
 	}
 
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "List cluster role bindings instead of role bindings")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role bindings (ignored with --cluster)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role bindings (ignored with --cluster, overrides current project)")
 	cmd.Flags().StringVar(&roleName, "role", "", "Filter by role name")
 
 	return cmd
@@ -150,7 +150,7 @@ func newBindingGetCommand() *cobra.Command {
 				if namespace == "" {
 					namespace = getCurrentNamespace(ctx)
 					if namespace == "" {
-						return fmt.Errorf("namespace is required for role bindings. Use --namespace")
+						return fmt.Errorf("namespace is required for role bindings. Use --namespace or set current project with 'ocp project <namespace>'")
 					}
 				}
 				binding, err := clientset.RbacV1().RoleBindings(namespace).Get(ctx, bindingName, metav1.GetOptions{})
@@ -163,7 +163,7 @@ func newBindingGetCommand() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "Get cluster role binding instead of role binding")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster, overrides current project)")
 
 	return cmd
 }
@@ -211,7 +211,7 @@ func newBindingDescribeCommand() *cobra.Command {
 				if namespace == "" {
 					namespace = getCurrentNamespace(ctx)
 					if namespace == "" {
-						return fmt.Errorf("namespace is required for role bindings. Use --namespace")
+						return fmt.Errorf("namespace is required for role bindings. Use --namespace or set current project with 'ocp project <namespace>'")
 					}
 				}
 				binding, err := clientset.RbacV1().RoleBindings(namespace).Get(ctx, bindingName, metav1.GetOptions{})
@@ -224,7 +224,7 @@ func newBindingDescribeCommand() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "Describe cluster role binding instead of role binding")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster, overrides current project)")
 
 	return cmd
 }
@@ -311,7 +311,7 @@ will be added to the existing binding.`,
 				if namespace == "" {
 					namespace = getCurrentNamespace(ctx)
 					if namespace == "" {
-						return fmt.Errorf("namespace is required for role bindings. Use --namespace")
+						return fmt.Errorf("namespace is required for role bindings. Use --namespace or set current project with 'ocp project <namespace>'")
 					}
 				}
 				return addSubjectToRoleBinding(ctx, clientset, namespace, roleName, subject, cmd.OutOrStdout())
@@ -320,7 +320,7 @@ will be added to the existing binding.`,
 	}
 
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "Add to cluster role binding instead of role binding")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster, overrides current project)")
 	cmd.Flags().StringVar(&user, "user", "", "User name to add")
 	cmd.Flags().StringVar(&group, "group", "", "Group name to add")
 	cmd.Flags().StringVar(&serviceAccount, "serviceaccount", "", "Service account to add (format: namespace/name)")
@@ -409,7 +409,7 @@ If the binding becomes empty after removal, it will be deleted.`,
 				if namespace == "" {
 					namespace = getCurrentNamespace(ctx)
 					if namespace == "" {
-						return fmt.Errorf("namespace is required for role bindings. Use --namespace")
+						return fmt.Errorf("namespace is required for role bindings. Use --namespace or set current project with 'ocp project <namespace>'")
 					}
 				}
 				return removeSubjectFromRoleBinding(ctx, clientset, namespace, roleName, subject, cmd.OutOrStdout())
@@ -418,7 +418,7 @@ If the binding becomes empty after removal, it will be deleted.`,
 	}
 
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "Remove from cluster role binding instead of role binding")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role binding (ignored with --cluster, overrides current project)")
 	cmd.Flags().StringVar(&user, "user", "", "User name to remove")
 	cmd.Flags().StringVar(&group, "group", "", "Group name to remove")
 	cmd.Flags().StringVar(&serviceAccount, "serviceaccount", "", "Service account to remove (format: namespace/name)")
@@ -461,7 +461,7 @@ that have the specified role.`,
 				if namespace == "" {
 					namespace = getCurrentNamespace(ctx)
 					if namespace == "" {
-						return fmt.Errorf("namespace is required for role bindings. Use --namespace")
+						return fmt.Errorf("namespace is required for role bindings. Use --namespace or set current project with 'ocp project <namespace>'")
 					}
 				}
 				return whoHasRole(ctx, clientset, namespace, roleName, cmd.OutOrStdout())
@@ -470,7 +470,7 @@ that have the specified role.`,
 	}
 
 	cmd.Flags().BoolVar(&cluster, "cluster", false, "Check cluster role bindings instead of role bindings")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role bindings (ignored with --cluster)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace for role bindings (ignored with --cluster, overrides current project)")
 
 	return cmd
 }
@@ -506,7 +506,7 @@ Searches through all bindings to find roles assigned to the user.`,
 		},
 	}
 
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Filter to specific namespace (empty for all namespaces)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Filter to specific namespace (empty for all namespaces, overrides current project)")
 
 	return cmd
 }
@@ -973,7 +973,17 @@ func formatSubjects(subjects []rbacv1.Subject) string {
 }
 
 func getCurrentNamespace(ctx context.Context) string {
-	// Try to get from kubeconfig context
+	// First check if project namespace is set in context
+	if projectNS := kube.ProjectNamespaceFromContext(ctx); projectNS != "" {
+		return projectNS
+	}
+
+	// Then try to get from stored project namespace file
+	if projectNS := getProjectNamespace(); projectNS != "" {
+		return projectNS
+	}
+
+	// Finally, try to get from kubeconfig context
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
 	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)

@@ -25,6 +25,14 @@ func newSSHCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ssh <node-pattern> [remote-command...]",
 		Short: "Establish an SSH session to a cluster node",
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// Complete node names for the first argument
+			if len(args) == 0 {
+				return completeNodeNames(cmd, args, toComplete)
+			}
+			// No completion for remote commands
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
 		Long: `Establish an SSH connection to a node matched by the provided pattern.
 
 When additional arguments are supplied after the node pattern they are treated
@@ -213,8 +221,11 @@ func resolveIdentityFile(identityFile string) (string, error) {
 	}
 
 	if resolvedIdentityFile != "" {
-		if _, err := os.Stat(resolvedIdentityFile); os.IsNotExist(err) {
-			return "", fmt.Errorf("identity file %q does not exist", resolvedIdentityFile)
+		if _, err := os.Stat(resolvedIdentityFile); err != nil {
+			if os.IsNotExist(err) {
+				return "", fmt.Errorf("identity file %q does not exist", resolvedIdentityFile)
+			}
+			return "", fmt.Errorf("failed to access identity file %q: %w", resolvedIdentityFile, err)
 		}
 	}
 

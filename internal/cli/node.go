@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -39,17 +40,32 @@ func newNodeCommand() *cobra.Command {
 		newNodeUncordonCommand(),
 		newNodeAnnotateCommand(),
 		newNodeLabelCommand(),
+		newNodeGetPodsCommand(),
 	)
 
 	return cmd
 }
 
 func newNodeListCommand() *cobra.Command {
-	return &cobra.Command{
+	var schedulingDisabled bool
+	var schedulable bool
+
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List nodes in the cluster",
+		Long: `List nodes in the cluster. Use flags to filter by scheduling state:
+  --scheduling-disabled, -d  Show only nodes that are in SchedulingDisabled state
+  --schedulable, -s            Show only nodes that are schedulable (not in SchedulingDisabled state)`,
 		Example: `  # List all nodes
-  ocp node list`,
+  ocp node list
+
+  # List only nodes that are SchedulingDisabled
+  ocp node list --scheduling-disabled
+  ocp node list -d
+
+  # List only schedulable nodes
+  ocp node list --schedulable
+  ocp node list -s`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -66,13 +82,33 @@ func newNodeListCommand() *cobra.Command {
 				return fmt.Errorf("failed to list nodes: %w", err)
 			}
 
+			// Filter nodes based on flags
+			var filteredNodes []corev1.Node
 			for _, node := range nodes.Items {
+				isDisabled := node.Spec.Unschedulable
+
+				if schedulingDisabled && !isDisabled {
+					continue
+				}
+				if schedulable && isDisabled {
+					continue
+				}
+
+				filteredNodes = append(filteredNodes, node)
+			}
+
+			for _, node := range filteredNodes {
 				fmt.Fprintln(cmd.OutOrStdout(), node.Name)
 			}
 
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVarP(&schedulingDisabled, "scheduling-disabled", "d", false, "Show only nodes that are in SchedulingDisabled state")
+	cmd.Flags().BoolVarP(&schedulable, "schedulable", "s", false, "Show only nodes that are schedulable (not in SchedulingDisabled state)")
+
+	return cmd
 }
 
 func newNodeInfoCommand() *cobra.Command {
@@ -180,23 +216,15 @@ func newNodeInfoCommand() *cobra.Command {
 				}
 			}
 
-			// Build format string for data (left-aligned)
+			// Build format string for data and headers (left-aligned)
 			dataFormat := fmt.Sprintf("%%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds\n",
 				widths["name"], widths["status"], widths["roles"], widths["age"], widths["version"],
 				widths["internalIP"], widths["externalIP"], widths["osImage"], widths["kernelVersion"], widths["containerRuntime"])
 
-			// Print header with center alignment
-			fmt.Fprintf(cmd.OutOrStdout(), "%s   %s   %s   %s   %s   %s   %s   %s   %s   %s\n",
-				centerPad("NAME", widths["name"]),
-				centerPad("STATUS", widths["status"]),
-				centerPad("ROLES", widths["roles"]),
-				centerPad("AGE", widths["age"]),
-				centerPad("VERSION", widths["version"]),
-				centerPad("INTERNAL-IP", widths["internalIP"]),
-				centerPad("EXTERNAL-IP", widths["externalIP"]),
-				centerPad("OS-IMAGE", widths["osImage"]),
-				centerPad("KERNEL-VERSION", widths["kernelVersion"]),
-				centerPad("CONTAINER-RUNTIME", widths["containerRuntime"]))
+			// Print header with left alignment
+			fmt.Fprintf(cmd.OutOrStdout(), dataFormat,
+				"NAME", "STATUS", "ROLES", "AGE", "VERSION",
+				"INTERNAL-IP", "EXTERNAL-IP", "OS-IMAGE", "KERNEL-VERSION", "CONTAINER-RUNTIME")
 
 			// Print each node
 			for _, data := range nodeList {
@@ -211,12 +239,13 @@ func newNodeInfoCommand() *cobra.Command {
 }
 
 func newNodeDescribeCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "describe <node-pattern>",
 		Short: "Show detailed information about a node",
 		Args:  cobra.ExactArgs(1),
 		Example: `  # Describe a specific node
   ocp node describe master-0`,
+		ValidArgsFunction: completeNodeNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
 
@@ -309,13 +338,15 @@ func newNodeDescribeCommand() *cobra.Command {
 			return nil
 		},
 	}
+	return cmd
 }
 
 func newNodeYamlCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "yaml <node-pattern>",
-		Short: "Display node information in YAML format",
-		Args:  cobra.ExactArgs(1),
+	cmd := &cobra.Command{
+		Use:               "yaml <node-pattern>",
+		Short:             "Display node information in YAML format",
+		ValidArgsFunction: completeNodeNames,
+		Args:              cobra.ExactArgs(1),
 		Example: `  # Output the node definition in YAML
   ocp node yaml worker-1`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -352,6 +383,7 @@ func newNodeYamlCommand() *cobra.Command {
 			return nil
 		},
 	}
+	return cmd
 }
 
 func newNodeRebootCommand() *cobra.Command {
@@ -359,9 +391,10 @@ func newNodeRebootCommand() *cobra.Command {
 	var identityFile string
 
 	cmd := &cobra.Command{
-		Use:   "reboot <node-pattern>",
-		Short: "Reboot a node via SSH",
-		Args:  cobra.ExactArgs(1),
+		Use:               "reboot <node-pattern>",
+		ValidArgsFunction: completeNodeNames,
+		Short:             "Reboot a node via SSH",
+		Args:              cobra.ExactArgs(1),
 		Example: `  # Reboot a specific node
   ocp node reboot worker-2
 
@@ -380,11 +413,14 @@ func newNodeRebootCommand() *cobra.Command {
 }
 
 func newNodeCordonCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "cordon <node-pattern>",
-		Short: "Mark node as unschedulable",
-		Args:  cobra.ExactArgs(1),
-		Example: `  # Prevent new pods from scheduling on a node
+	cmd := &cobra.Command{
+		Use:               "cordon <node-pattern>",
+		ValidArgsFunction: completeNodeNames,
+		Short:             "Mark node as unschedulable",
+		Long: `Mark a node as unschedulable to prevent new pods from being scheduled on it.
+The command will automatically add the annotation "node.dana.io/reason: Maintenance" before cordoning.`,
+		Args: cobra.ExactArgs(1),
+		Example: `  # Prevent new pods from scheduling on a node (annotation will be added automatically)
   ocp node cordon master-0`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
@@ -404,6 +440,26 @@ func newNodeCordonCommand() *cobra.Command {
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
+			// Add maintenance annotation if it doesn't exist
+			if node.Annotations == nil {
+				node.Annotations = make(map[string]string)
+			}
+			if node.Annotations[maintenanceAnnotationKey] != maintenanceAnnotationValue {
+				node.Annotations[maintenanceAnnotationKey] = maintenanceAnnotationValue
+				_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to add maintenance annotation to node %q: %w", node.Name, err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Added maintenance annotation to node %q\n", node.Name)
+			}
+
+			// Get fresh node data after annotation update
+			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
+			}
+
+			// Cordon the node
 			node.Spec.Unschedulable = true
 			_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 			if err != nil {
@@ -414,17 +470,18 @@ func newNodeCordonCommand() *cobra.Command {
 			return nil
 		},
 	}
+	return cmd
 }
 
 func newNodeDrainCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "drain <node-pattern>",
-		Short: "Drain a node (cordon + evict pods)",
+	cmd := &cobra.Command{
+		Use:               "drain <node-pattern>",
+		ValidArgsFunction: completeNodeNames,
+		Short:             "Drain a node (cordon + evict pods)",
 		Long: `Drain a node by marking it as unschedulable and evicting all pods.
-The node must have the annotation "node.dana.io/reason: Maintenance" before draining.`,
+The command will automatically add the annotation "node.dana.io/reason: Maintenance" before draining.`,
 		Args: cobra.ExactArgs(1),
-		Example: `  # Drain a node after adding the maintenance annotation
-  ocp node annotate worker-3 node.dana.io/reason=Maintenance
+		Example: `  # Drain a node (annotation will be added automatically)
   ocp node drain worker-3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
@@ -439,14 +496,28 @@ The node must have the annotation "node.dana.io/reason: Maintenance" before drai
 				return err
 			}
 
-			// Check for required annotation
-			if node.Annotations == nil || node.Annotations[maintenanceAnnotationKey] != maintenanceAnnotationValue {
-				return fmt.Errorf("node %q must have annotation %q=%q before draining", node.Name, maintenanceAnnotationKey, maintenanceAnnotationValue)
-			}
-
 			clientset, err := kube.NewClientset(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			// Add maintenance annotation if it doesn't exist
+			if node.Annotations == nil {
+				node.Annotations = make(map[string]string)
+			}
+			if node.Annotations[maintenanceAnnotationKey] != maintenanceAnnotationValue {
+				node.Annotations[maintenanceAnnotationKey] = maintenanceAnnotationValue
+				_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to add maintenance annotation to node %q: %w", node.Name, err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Added maintenance annotation to node %q\n", node.Name)
+			}
+
+			// Get fresh node data after annotation update
+			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
 			}
 
 			// Cordon the node
@@ -499,14 +570,16 @@ The node must have the annotation "node.dana.io/reason: Maintenance" before drai
 			return nil
 		},
 	}
+	return cmd
 }
 
 func newNodeUncordonCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "uncordon <node-pattern>",
-		Short: "Mark node as schedulable and remove maintenance annotation",
-		Long:  `Mark a node as schedulable and remove the "node.dana.io/reason" annotation if present.`,
-		Args:  cobra.ExactArgs(1),
+	cmd := &cobra.Command{
+		Use:               "uncordon <node-pattern>",
+		ValidArgsFunction: completeNodeNames,
+		Short:             "Mark node as schedulable and remove maintenance annotation",
+		Long:              `Mark a node as schedulable and remove the "node.dana.io/reason" annotation. The annotation will be removed first, then the node will be uncordoned.`,
+		Args:              cobra.ExactArgs(1),
 		Example: `  # Remove the maintenance annotation and allow scheduling
   ocp node uncordon worker-3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -529,11 +602,13 @@ func newNodeUncordonCommand() *cobra.Command {
 
 			// Remove maintenance annotation if present
 			if node.Annotations != nil && node.Annotations[maintenanceAnnotationKey] != "" {
-				patch := fmt.Sprintf(`[{"op":"remove","path":"/metadata/annotations/%s"}]`, strings.ReplaceAll(maintenanceAnnotationKey, "/", "~1"))
+				escapedKey := strings.ReplaceAll(maintenanceAnnotationKey, "/", "~1")
+				patch := fmt.Sprintf(`[{"op":"remove","path":"/metadata/annotations/%s"}]`, escapedKey)
 				_, err = clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
 				if err != nil {
 					return fmt.Errorf("failed to remove annotation from node %q: %w", node.Name, err)
 				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Removed maintenance annotation from node %q\n", node.Name)
 			}
 
 			// Get fresh node copy for uncordon
@@ -553,27 +628,41 @@ func newNodeUncordonCommand() *cobra.Command {
 			return nil
 		},
 	}
+	return cmd
 }
 
 func newNodeAnnotateCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "annotate <node-pattern> <annotation>",
+	cmd := &cobra.Command{
+		Use: "annotate <node-pattern> <annotation>",
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// Complete node names for the first argument
+			if len(args) == 0 {
+				return completeNodeNames(cmd, args, toComplete)
+			}
+			// No completion for annotation argument
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
 		Short: "Add or update an annotation on a node",
-		Long: `Add or update an annotation on a node matching the pattern.
-The annotation should be in the format "key=value" or "key" (to remove).
+		Long: `Add or update annotations on a node matching the pattern.
+Annotations should be in the format "key=value" or "key" (to remove).
+Multiple annotations can be specified separated by commas (no spaces).
 
 Examples:
   ocp node annotate node-24 node.dana.io/reason=Maintenance
-  ocp node annotate node-24 node.dana.io/reason`,
+  ocp node annotate node-24 node.dana.io/reason
+  ocp node annotate node-24 key1=value1,key2=value2,key3=value3`,
 		Args: cobra.ExactArgs(2),
-		Example: `  # Add an annotation
+		Example: `  # Add a single annotation
   ocp node annotate worker-2 purpose=maintenance
+
+  # Add multiple annotations at once
+  ocp node annotate worker-2 purpose=maintenance,environment=prod,team=platform
 
   # Remove an annotation
   ocp node annotate worker-2 purpose`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
-			annotation := args[1]
+			annotationsStr := args[1]
 
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -590,39 +679,69 @@ Examples:
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			// Parse annotation key=value or key
-			parts := strings.SplitN(annotation, "=", 2)
-			key := parts[0]
-			var value string
-			var remove bool
+			// Parse comma-separated annotations
+			annotationParts := strings.Split(annotationsStr, ",")
+			var patchOps []string
+			var needsAnnotationsInit bool
+			var addedKeys []string
+			var removedKeys []string
 
-			if len(parts) == 2 {
-				value = parts[1]
-				remove = false
-			} else {
-				remove = true
+			for _, annotation := range annotationParts {
+				annotation = strings.TrimSpace(annotation)
+				if annotation == "" {
+					continue
+				}
+
+				// Parse annotation key=value or key
+				parts := strings.SplitN(annotation, "=", 2)
+				key := parts[0]
+				var value string
+				var remove bool
+
+				if len(parts) == 2 {
+					value = parts[1]
+					remove = false
+				} else {
+					remove = true
+				}
+
+				if remove {
+					// Remove annotation
+					if node.Annotations == nil || node.Annotations[key] == "" {
+						fmt.Fprintf(cmd.OutOrStdout(), "Annotation %q not found on node %q\n", key, node.Name)
+						continue
+					}
+					escapedKey := strings.ReplaceAll(key, "/", "~1")
+					patchOps = append(patchOps, fmt.Sprintf(`{"op":"remove","path":"/metadata/annotations/%s"}`, escapedKey))
+					removedKeys = append(removedKeys, key)
+				} else {
+					// Add or update annotation
+					if node.Annotations == nil && !needsAnnotationsInit {
+						needsAnnotationsInit = true
+					}
+					escapedKey := strings.ReplaceAll(key, "/", "~1")
+					// JSON escape the value for the JSON string literal
+					jsonEscapedValue, err := json.Marshal(value)
+					if err != nil {
+						return fmt.Errorf("failed to escape annotation value for key %q: %w", key, err)
+					}
+					// Remove surrounding quotes from marshaled JSON string
+					jsonValueStr := string(jsonEscapedValue[1 : len(jsonEscapedValue)-1])
+					patchOps = append(patchOps, fmt.Sprintf(`{"op":"add","path":"/metadata/annotations/%s","value":"%s"}`, escapedKey, jsonValueStr))
+					addedKeys = append(addedKeys, key)
+				}
 			}
 
-			// Build patch
+			if len(patchOps) == 0 {
+				return nil
+			}
+
+			// Build patch with initialization if needed
 			var patch string
-			if remove {
-				// Remove annotation
-				if node.Annotations == nil || node.Annotations[key] == "" {
-					fmt.Fprintf(cmd.OutOrStdout(), "Annotation %q not found on node %q\n", key, node.Name)
-					return nil
-				}
-				escapedKey := strings.ReplaceAll(key, "/", "~1")
-				patch = fmt.Sprintf(`[{"op":"remove","path":"/metadata/annotations/%s"}]`, escapedKey)
+			if needsAnnotationsInit {
+				patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/annotations","value":{}},%s]`, strings.Join(patchOps, ","))
 			} else {
-				// Add or update annotation
-				escapedKey := strings.ReplaceAll(key, "/", "~1")
-				escapedValue := strings.ReplaceAll(value, "~", "~0")
-				escapedValue = strings.ReplaceAll(escapedValue, "/", "~1")
-				if node.Annotations == nil {
-					patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/annotations","value":{}},{"op":"add","path":"/metadata/annotations/%s","value":"%s"}]`, escapedKey, escapedValue)
-				} else {
-					patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/annotations/%s","value":"%s"}]`, escapedKey, escapedValue)
-				}
+				patch = fmt.Sprintf(`[%s]`, strings.Join(patchOps, ","))
 			}
 
 			_, err = clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
@@ -630,36 +749,52 @@ Examples:
 				return fmt.Errorf("failed to annotate node %q: %w", node.Name, err)
 			}
 
-			if remove {
-				fmt.Fprintf(cmd.OutOrStdout(), "Removed annotation %q from node %q\n", key, node.Name)
-			} else {
-				fmt.Fprintf(cmd.OutOrStdout(), "Added annotation %q=%q to node %q\n", key, value, node.Name)
+			// Print results
+			if len(removedKeys) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Removed annotation(s) %v from node %q\n", removedKeys, node.Name)
+			}
+			if len(addedKeys) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Added annotation(s) %v to node %q\n", addedKeys, node.Name)
 			}
 
 			return nil
 		},
 	}
+	return cmd
 }
 
 func newNodeLabelCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "label <node-pattern> <label>",
+	cmd := &cobra.Command{
+		Use: "label <node-pattern> <label>",
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// Complete node names for the first argument
+			if len(args) == 0 {
+				return completeNodeNames(cmd, args, toComplete)
+			}
+			// No completion for label argument
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
 		Short: "Add or update a label on a node",
-		Long: `Add or update a label on a node matching the pattern.
-The label should be in the format "key=value" or "key-" (to remove).
+		Long: `Add or update labels on a node matching the pattern.
+Labels should be in the format "key=value" or "key-" (to remove).
+Multiple labels can be specified separated by commas (no spaces).
 
 Examples:
   ocp node label node-24 environment=production
-  ocp node label node-24 environment-`,
+  ocp node label node-24 environment-
+  ocp node label node-24 key1=value1,key2=value2,key3-`,
 		Args: cobra.ExactArgs(2),
-		Example: `  # Add or update a label
+		Example: `  # Add or update a single label
   ocp node label worker-1 zone=us-east-1a
+
+  # Add multiple labels at once
+  ocp node label worker-1 zone=us-east-1a,environment=prod,team=platform
 
   # Remove a label
   ocp node label worker-1 zone-`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pattern := args[0]
-			label := args[1]
+			labelsStr := args[1]
 
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -676,43 +811,74 @@ Examples:
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			// Parse label key=value or key- (remove)
-			var key, value string
-			var remove bool
+			// Parse comma-separated labels
+			labelParts := strings.Split(labelsStr, ",")
+			var patchOps []string
+			var needsLabelsInit bool
+			var addedKeys []string
+			var removedKeys []string
 
-			if strings.HasSuffix(label, "-") {
-				key = strings.TrimSuffix(label, "-")
-				remove = true
-			} else {
-				parts := strings.SplitN(label, "=", 2)
-				if len(parts) != 2 {
-					return fmt.Errorf("invalid label format: expected key=value or key-, got %q", label)
+			for _, label := range labelParts {
+				label = strings.TrimSpace(label)
+				if label == "" {
+					continue
 				}
-				key = parts[0]
-				value = parts[1]
-				remove = false
+
+				// Parse label key=value or key- (remove)
+				var key, value string
+				var remove bool
+
+				if strings.HasSuffix(label, "-") {
+					key = strings.TrimSuffix(label, "-")
+					remove = true
+				} else {
+					parts := strings.SplitN(label, "=", 2)
+					if len(parts) != 2 {
+						return fmt.Errorf("invalid label format: expected key=value or key-, got %q", label)
+					}
+					key = parts[0]
+					value = parts[1]
+					remove = false
+				}
+
+				if remove {
+					// Remove label
+					if node.Labels == nil || node.Labels[key] == "" {
+						fmt.Fprintf(cmd.OutOrStdout(), "Label %q not found on node %q\n", key, node.Name)
+						continue
+					}
+					escapedKey := strings.ReplaceAll(key, "/", "~1")
+					patchOps = append(patchOps, fmt.Sprintf(`{"op":"remove","path":"/metadata/labels/%s"}`, escapedKey))
+					removedKeys = append(removedKeys, key)
+				} else {
+					// Add or update label
+					if node.Labels == nil && !needsLabelsInit {
+						needsLabelsInit = true
+					}
+					// JSON Pointer escape the key for the path
+					escapedKey := strings.ReplaceAll(key, "/", "~1")
+					// JSON escape the value for the JSON string literal
+					jsonEscapedValue, err := json.Marshal(value)
+					if err != nil {
+						return fmt.Errorf("failed to escape label value for key %q: %w", key, err)
+					}
+					// Remove surrounding quotes from marshaled JSON string
+					jsonValueStr := string(jsonEscapedValue[1 : len(jsonEscapedValue)-1])
+					patchOps = append(patchOps, fmt.Sprintf(`{"op":"add","path":"/metadata/labels/%s","value":"%s"}`, escapedKey, jsonValueStr))
+					addedKeys = append(addedKeys, key)
+				}
 			}
 
-			// Build patch
+			if len(patchOps) == 0 {
+				return nil
+			}
+
+			// Build patch with initialization if needed
 			var patch string
-			if remove {
-				// Remove label
-				if node.Labels == nil || node.Labels[key] == "" {
-					fmt.Fprintf(cmd.OutOrStdout(), "Label %q not found on node %q\n", key, node.Name)
-					return nil
-				}
-				escapedKey := strings.ReplaceAll(key, "/", "~1")
-				patch = fmt.Sprintf(`[{"op":"remove","path":"/metadata/labels/%s"}]`, escapedKey)
+			if needsLabelsInit {
+				patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/labels","value":{}},%s]`, strings.Join(patchOps, ","))
 			} else {
-				// Add or update label
-				escapedKey := strings.ReplaceAll(key, "/", "~1")
-				escapedValue := strings.ReplaceAll(value, "~", "~0")
-				escapedValue = strings.ReplaceAll(escapedValue, "/", "~1")
-				if node.Labels == nil {
-					patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/labels","value":{}},{"op":"add","path":"/metadata/labels/%s","value":"%s"}]`, escapedKey, escapedValue)
-				} else {
-					patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/labels/%s","value":"%s"}]`, escapedKey, escapedValue)
-				}
+				patch = fmt.Sprintf(`[%s]`, strings.Join(patchOps, ","))
 			}
 
 			_, err = clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
@@ -720,15 +886,165 @@ Examples:
 				return fmt.Errorf("failed to label node %q: %w", node.Name, err)
 			}
 
-			if remove {
-				fmt.Fprintf(cmd.OutOrStdout(), "Removed label %q from node %q\n", key, node.Name)
-			} else {
-				fmt.Fprintf(cmd.OutOrStdout(), "Added label %q=%q to node %q\n", key, value, node.Name)
+			// Print results
+			if len(removedKeys) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Removed label(s) %v from node %q\n", removedKeys, node.Name)
+			}
+			if len(addedKeys) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Added label(s) %v to node %q\n", addedKeys, node.Name)
 			}
 
 			return nil
 		},
 	}
+	return cmd
+}
+
+func newNodeGetPodsCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "getpods <node-name>",
+		Short: "List all pods running on a specific node",
+		Long: `List all pods running on a specific node with detailed information including
+namespace, name, ready state, status, restarts, and age.
+
+Examples:
+  ocp node getpods worker-0
+  ocp node getpods master-1`,
+		Args: cobra.ExactArgs(1),
+		Example: `  # List all pods on a specific node
+  ocp node getpods worker-0`,
+		ValidArgsFunction: completeNodeNames,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			nodeName := args[0]
+
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			// Verify node exists
+			_, err = clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to get node %q: %w", nodeName, err)
+			}
+
+			// Get pods on this node
+			pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to list pods on node %q: %w", nodeName, err)
+			}
+
+			if len(pods.Items) == 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "No pods found on node %q\n", nodeName)
+				return nil
+			}
+
+			// Calculate column widths
+			type podData struct {
+				namespace string
+				name      string
+				ready     string
+				status    string
+				restarts  string
+				age       string
+			}
+
+			var podList []podData
+			widths := map[string]int{
+				"namespace": len("NAMESPACE"),
+				"name":      len("NAME"),
+				"ready":     len("READY"),
+				"status":    len("STATUS"),
+				"restarts":  len("RESTARTS"),
+				"age":       len("AGE"),
+			}
+
+			for _, pod := range pods.Items {
+				ready := getPodReady(&pod)
+				status := string(pod.Status.Phase)
+				restarts := getPodRestarts(&pod)
+				age := formatAge(pod.CreationTimestamp.Time)
+
+				data := podData{
+					namespace: pod.Namespace,
+					name:      pod.Name,
+					ready:     ready,
+					status:    status,
+					restarts:  restarts,
+					age:       age,
+				}
+
+				podList = append(podList, data)
+
+				// Update widths
+				if len(data.namespace) > widths["namespace"] {
+					widths["namespace"] = len(data.namespace)
+				}
+				if len(data.name) > widths["name"] {
+					widths["name"] = len(data.name)
+				}
+				if len(data.ready) > widths["ready"] {
+					widths["ready"] = len(data.ready)
+				}
+				if len(data.status) > widths["status"] {
+					widths["status"] = len(data.status)
+				}
+				if len(data.restarts) > widths["restarts"] {
+					widths["restarts"] = len(data.restarts)
+				}
+				if len(data.age) > widths["age"] {
+					widths["age"] = len(data.age)
+				}
+			}
+
+			// Build format string for data and headers (left-aligned)
+			dataFormat := fmt.Sprintf("%%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds   %%-%ds\n",
+				widths["namespace"], widths["name"], widths["ready"], widths["status"], widths["restarts"], widths["age"])
+
+			// Print header with left alignment
+			fmt.Fprintf(cmd.OutOrStdout(), dataFormat,
+				"NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "AGE")
+
+			// Print each pod
+			for _, data := range podList {
+				fmt.Fprintf(cmd.OutOrStdout(), dataFormat,
+					data.namespace, data.name, data.ready, data.status, data.restarts, data.age)
+			}
+
+			return nil
+		},
+	}
+	return cmd
+}
+
+// getPodReady returns the ready state in format "ready/total"
+func getPodReady(pod *corev1.Pod) string {
+	total := len(pod.Spec.Containers)
+	ready := 0
+
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.Ready {
+			ready++
+		}
+	}
+
+	return fmt.Sprintf("%d/%d", ready, total)
+}
+
+// getPodRestarts returns the total number of restarts across all containers
+func getPodRestarts(pod *corev1.Pod) string {
+	totalRestarts := int32(0)
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		totalRestarts += containerStatus.RestartCount
+	}
+	return fmt.Sprintf("%d", totalRestarts)
 }
 
 // findNodeByPattern finds a node matching the regex pattern
@@ -788,15 +1104,31 @@ func getNodeRoles(node *corev1.Node) string {
 
 // getNodeStatus returns the status of the node (Ready/NotReady)
 func getNodeStatus(node *corev1.Node) string {
+	var status string
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == corev1.NodeReady {
 			if condition.Status == corev1.ConditionTrue {
-				return "Ready"
+				status = "Ready"
+			} else {
+				status = "NotReady"
 			}
-			return "NotReady"
+			break
 		}
 	}
-	return "Unknown"
+	if status == "" {
+		status = "Unknown"
+	}
+
+	// Add SchedulingDisabled if node is unschedulable
+	if node.Spec.Unschedulable {
+		if status != "" {
+			status += ", SchedulingDisabled"
+		} else {
+			status = "SchedulingDisabled"
+		}
+	}
+
+	return status
 }
 
 // getNodeInternalIP returns the internal IP address of the node

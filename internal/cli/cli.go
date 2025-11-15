@@ -61,7 +61,9 @@ func (c *CLI) configure() {
 		newSSHCommand(),
 		newClusterCommand(),
 		newNodeCommand(),
+		newMCPCommand(),
 		newVersionCommand(),
+		newCompletionCommand(c.root),
 	)
 }
 
@@ -80,7 +82,11 @@ func resolveConfigPath(path string) (string, error) {
 			return "", fmt.Errorf("resolve kubeconfig path %q: %w", path, err)
 		}
 
-		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
+		if path == "~" {
+			path = home
+		} else {
+			path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+		}
 	}
 
 	absPath, err := filepath.Abs(path)
@@ -102,4 +108,42 @@ func resolveConfigPath(path string) (string, error) {
 	}
 
 	return absPath, nil
+}
+
+func newCompletionCommand(root *cobra.Command) *cobra.Command {
+	return &cobra.Command{
+		Use:   "completion [bash|zsh|fish|powershell]",
+		Short: "Generate shell completion scripts",
+		Long: `Generate shell completion scripts for ocp CLI.
+
+To load completions in your current shell session:
+  source <(ocp completion bash)  # for bash
+  source <(ocp completion zsh)   # for zsh
+
+To load completions for all new shells, add the completion script to your shell's completion directory.
+For bash, this is typically ~/.bashrc or ~/.bash_profile.
+For zsh, this is typically ~/.zshrc.`,
+		Example: `  # Generate bash completion
+  ocp completion bash > /etc/bash_completion.d/ocp
+
+  # Generate zsh completion
+  ocp completion zsh > "${fpath[1]}/_ocp"`,
+		ValidArgs: []string{"bash", "zsh", "fish", "powershell"},
+		Args:      cobra.ExactValidArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			shell := args[0]
+			switch shell {
+			case "bash":
+				return root.GenBashCompletion(cmd.OutOrStdout())
+			case "zsh":
+				return root.GenZshCompletion(cmd.OutOrStdout())
+			case "fish":
+				return root.GenFishCompletion(cmd.OutOrStdout(), true)
+			case "powershell":
+				return root.GenPowerShellCompletion(cmd.OutOrStdout())
+			default:
+				return fmt.Errorf("unsupported shell: %s", shell)
+			}
+		},
+	}
 }

@@ -82,8 +82,7 @@ func newNodeListCommand() *cobra.Command {
 				return fmt.Errorf("failed to list nodes: %w", err)
 			}
 
-			// Filter nodes based on flags
-			var filteredNodes []corev1.Node
+			// Filter nodes based on flags - iterate once and print directly
 			for _, node := range nodes.Items {
 				isDisabled := node.Spec.Unschedulable
 
@@ -94,10 +93,6 @@ func newNodeListCommand() *cobra.Command {
 					continue
 				}
 
-				filteredNodes = append(filteredNodes, node)
-			}
-
-			for _, node := range filteredNodes {
 				fmt.Fprintln(cmd.OutOrStdout(), node.Name)
 			}
 
@@ -254,17 +249,17 @@ func newNodeDescribeCommand() *cobra.Command {
 				ctx = context.Background()
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
-			if err != nil {
-				return err
-			}
-
 			clientset, err := kube.NewClientset(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			// Get fresh node data
+			node, err := findNodeByPattern(ctx, pattern)
+			if err != nil {
+				return err
+			}
+
+			// Get fresh node data (findNodeByPattern returns from List, so we refresh for latest state)
 			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
@@ -357,17 +352,17 @@ func newNodeYamlCommand() *cobra.Command {
 				ctx = context.Background()
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
-			if err != nil {
-				return err
-			}
-
 			clientset, err := kube.NewClientset(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			// Get fresh node data
+			node, err := findNodeByPattern(ctx, pattern)
+			if err != nil {
+				return err
+			}
+
+			// Get fresh node data (findNodeByPattern returns from List, so we refresh for latest state)
 			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
@@ -927,13 +922,7 @@ Examples:
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			// Verify node exists
-			_, err = clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to get node %q: %w", nodeName, err)
-			}
-
-			// Get pods on this node
+			// Get pods on this node (FieldSelector will fail fast if node doesn't exist)
 			pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 				FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
 			})
@@ -1049,11 +1038,6 @@ func getPodRestarts(pod *corev1.Pod) string {
 
 // findNodeByPattern finds a node matching the regex pattern
 func findNodeByPattern(ctx context.Context, pattern string) (*corev1.Node, error) {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return nil, fmt.Errorf("invalid node pattern %q: %w", pattern, err)
-	}
-
 	clientset, err := kube.NewClientset(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
@@ -1062,6 +1046,19 @@ func findNodeByPattern(ctx context.Context, pattern string) (*corev1.Node, error
 	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	// Try exact match first (common case, faster)
+	for i := range nodes.Items {
+		if nodes.Items[i].Name == pattern {
+			return &nodes.Items[i], nil
+		}
+	}
+
+	// If not exact match, try regex
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid node pattern %q: %w", pattern, err)
 	}
 
 	var matches []*corev1.Node
@@ -1077,7 +1074,7 @@ func findNodeByPattern(ctx context.Context, pattern string) (*corev1.Node, error
 	case 1:
 		return matches[0], nil
 	default:
-		var names []string
+		names := make([]string, 0, len(matches))
 		for _, node := range matches {
 			names = append(names, node.Name)
 		}
@@ -1087,15 +1084,24 @@ func findNodeByPattern(ctx context.Context, pattern string) (*corev1.Node, error
 
 // getNodeRoles returns a comma-separated list of node roles
 func getNodeRoles(node *corev1.Node) string {
+	if len(node.Labels) == 0 {
+		return "<none>"
+	}
+
+	const rolePrefix = "node-role.kubernetes.io/"
 	var roles []string
+	// Pre-allocate slice with estimated capacity
+	roles = make([]string, 0, 3) // Most nodes have 1-3 roles
+
 	for label := range node.Labels {
-		if strings.HasPrefix(label, "node-role.kubernetes.io/") {
-			role := strings.TrimPrefix(label, "node-role.kubernetes.io/")
+		if strings.HasPrefix(label, rolePrefix) {
+			role := label[len(rolePrefix):]
 			if role != "" {
 				roles = append(roles, role)
 			}
 		}
 	}
+
 	if len(roles) == 0 {
 		return "<none>"
 	}
@@ -1121,11 +1127,7 @@ func getNodeStatus(node *corev1.Node) string {
 
 	// Add SchedulingDisabled if node is unschedulable
 	if node.Spec.Unschedulable {
-		if status != "" {
-			status += ", SchedulingDisabled"
-		} else {
-			status = "SchedulingDisabled"
-		}
+		status += ", SchedulingDisabled"
 	}
 
 	return status
@@ -1171,26 +1173,4 @@ func formatAge(t time.Time) string {
 	}
 
 	return fmt.Sprintf("%ds", int(duration.Seconds()))
-}
-
-// truncate truncates a string to the specified length
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	if maxLen <= 3 {
-		return s[:maxLen]
-	}
-	return s[:maxLen-3] + "..."
-}
-
-// centerPad centers a string within a given width by padding with spaces
-func centerPad(s string, width int) string {
-	if len(s) >= width {
-		return s
-	}
-	totalPad := width - len(s)
-	leftPad := totalPad / 2
-	rightPad := totalPad - leftPad
-	return strings.Repeat(" ", leftPad) + s + strings.Repeat(" ", rightPad)
 }

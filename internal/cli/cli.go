@@ -129,7 +129,7 @@ For zsh, this is typically ~/.zshrc.`,
   # Generate zsh completion
   ocp completion zsh > "${fpath[1]}/_ocp"`,
 		ValidArgs: []string{"bash", "zsh", "fish", "powershell"},
-		Args:      cobra.ExactValidArgs(1),
+		Args:      cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			shell := args[0]
 			switch shell {

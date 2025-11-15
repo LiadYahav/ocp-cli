@@ -76,7 +76,7 @@ func newClusterInfoCommand() *cobra.Command {
 				return fmt.Errorf("failed to list namespaces: %w", err)
 			}
 
-			// Get all pods
+			// Get all pods (required for accurate count - API handles pagination efficiently)
 			pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to list pods: %w", err)

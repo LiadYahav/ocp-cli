@@ -30,7 +30,8 @@ func completeNodeNames(cmd *cobra.Command, args []string, toComplete string) ([]
 		return nil, cobra.ShellCompDirectiveError
 	}
 
-	var completions []string
+	// Pre-allocate slice with estimated capacity
+	completions := make([]string, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
 		if strings.HasPrefix(node.Name, toComplete) {
 			completions = append(completions, node.Name)
@@ -67,10 +68,11 @@ func completeMCPNames(cmd *cobra.Command, args []string, toComplete string) ([]s
 		return nil, cobra.ShellCompDirectiveError
 	}
 
-	var completions []string
+	// Pre-allocate slice with estimated capacity
+	completions := make([]string, 0, len(mcps.Items))
 	for _, mcp := range mcps.Items {
 		name, found, _ := unstructured.NestedString(mcp.Object, "metadata", "name")
-		if found && strings.HasPrefix(name, toComplete) {
+		if found && name != "" && strings.HasPrefix(name, toComplete) {
 			completions = append(completions, name)
 		}
 	}
@@ -81,7 +83,7 @@ func completeMCPNames(cmd *cobra.Command, args []string, toComplete string) ([]s
 // completeMCPActions returns the available actions for MCP command
 func completeMCPActions(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 	actions := []string{"resume", "stop"}
-	var completions []string
+	completions := make([]string, 0, len(actions))
 	for _, action := range actions {
 		if strings.HasPrefix(action, toComplete) {
 			completions = append(completions, action)

@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -23,7 +22,7 @@ func newSSHCommand() *cobra.Command {
 	var identityFile string
 
 	cmd := &cobra.Command{
-		Use:   "ssh <node-pattern> [remote-command...]",
+		Use:   "ssh <node-name> [remote-command...]",
 		Short: "Establish an SSH session to a cluster node",
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			// Complete node names for the first argument
@@ -33,9 +32,9 @@ func newSSHCommand() *cobra.Command {
 			// No completion for remote commands
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		},
-		Long: `Establish an SSH connection to a node matched by the provided pattern.
+		Long: `Establish an SSH connection to a node by name.
 
-When additional arguments are supplied after the node pattern they are treated
+When additional arguments are supplied after the node name they are treated
 as remote commands to execute in sequence on the node (like a script).
 
 By default, the CLI will use ~/.ssh/id_rsa_ocp as the SSH private key if it exists.
@@ -64,9 +63,9 @@ Examples:
   # Run multiple commands sequentially
   ocp ssh master-0 "whoami" "cat /etc/os-release"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 
-			return runSSHCommand(cmd.Context(), user, identityFile, pattern, args[1:], cmd)
+			return runSSHCommand(cmd.Context(), user, identityFile, nodeName, args[1:], cmd)
 		},
 	}
 
@@ -94,64 +93,23 @@ func expandPath(path string) (string, error) {
 	return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
 }
 
-func resolveNodeIP(ctx context.Context, pattern string) (string, error) {
+func resolveNodeIP(ctx context.Context, nodeName string) (string, error) {
 	clientset, err := kube.NewClientset(ctx)
 	if err != nil {
 		return "", err
 	}
 
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
-		return "", fmt.Errorf("failed to list nodes: %w", err)
+		return "", fmt.Errorf("failed to get node %q: %w", nodeName, err)
 	}
 
-	ip, err := selectNodeIP(nodes.Items, pattern)
-	if err != nil {
-		return "", err
+	ip := findNodeIP(node.Status.Addresses)
+	if ip == "" {
+		return "", fmt.Errorf("node %q has no IP address", nodeName)
 	}
 
 	return ip, nil
-}
-
-func selectNodeIP(nodes []corev1.Node, pattern string) (string, error) {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return "", fmt.Errorf("invalid node pattern %q: %w", pattern, err)
-	}
-
-	type nodeEntry struct {
-		name string
-		ip   string
-	}
-
-	var matches []nodeEntry
-
-	for _, node := range nodes {
-		if !re.MatchString(node.Name) {
-			continue
-		}
-
-		ip := findNodeIP(node.Status.Addresses)
-		if ip == "" {
-			continue
-		}
-
-		matches = append(matches, nodeEntry{name: node.Name, ip: ip})
-	}
-
-	switch len(matches) {
-	case 0:
-		return "", fmt.Errorf("no node matched pattern %q", pattern)
-	case 1:
-		return matches[0].ip, nil
-	default:
-		var names []string
-		for _, match := range matches {
-			names = append(names, match.name)
-		}
-
-		return "", fmt.Errorf("pattern matched multiple nodes: %s", strings.Join(names, ", "))
-	}
 }
 
 func findNodeIP(addresses []corev1.NodeAddress) string {
@@ -171,12 +129,12 @@ func findNodeIP(addresses []corev1.NodeAddress) string {
 	return external
 }
 
-func runSSHCommand(ctx context.Context, user, identityFile, pattern string, commands []string, cobraCmd *cobra.Command) error {
+func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, commands []string, cobraCmd *cobra.Command) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	ip, err := resolveNodeIP(ctx, pattern)
+	ip, err := resolveNodeIP(ctx, nodeName)
 	if err != nil {
 		return err
 	}

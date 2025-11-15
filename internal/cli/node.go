@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -235,14 +234,14 @@ func newNodeInfoCommand() *cobra.Command {
 
 func newNodeDescribeCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "describe <node-pattern>",
+		Use:   "describe <node-name>",
 		Short: "Show detailed information about a node",
 		Args:  cobra.ExactArgs(1),
 		Example: `  # Describe a specific node
   ocp node describe master-0`,
 		ValidArgsFunction: completeNodeNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -254,15 +253,9 @@ func newNodeDescribeCommand() *cobra.Command {
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
+			node, err := findNodeByName(ctx, nodeName)
 			if err != nil {
 				return err
-			}
-
-			// Get fresh node data (findNodeByPattern returns from List, so we refresh for latest state)
-			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
 			}
 
 			// Get pods on this node
@@ -338,34 +331,23 @@ func newNodeDescribeCommand() *cobra.Command {
 
 func newNodeYamlCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:               "yaml <node-pattern>",
+		Use:               "yaml <node-name>",
 		Short:             "Display node information in YAML format",
 		ValidArgsFunction: completeNodeNames,
 		Args:              cobra.ExactArgs(1),
 		Example: `  # Output the node definition in YAML
   ocp node yaml worker-1`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
 			}
 
-			clientset, err := kube.NewClientset(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to create Kubernetes client: %w", err)
-			}
-
-			node, err := findNodeByPattern(ctx, pattern)
+			node, err := findNodeByName(ctx, nodeName)
 			if err != nil {
 				return err
-			}
-
-			// Get fresh node data (findNodeByPattern returns from List, so we refresh for latest state)
-			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
 			}
 
 			// Convert to YAML
@@ -386,18 +368,17 @@ func newNodeRebootCommand() *cobra.Command {
 	var identityFile string
 
 	cmd := &cobra.Command{
-		Use:               "reboot <node-pattern>",
+		Use:               "reboot <node-name>",
 		ValidArgsFunction: completeNodeNames,
 		Short:             "Reboot a node via SSH",
-		Args:              cobra.ExactArgs(1),
+		Long: `Reboot a node by SSHing into it and running 'sudo reboot'.
+This command connects to the specified node by name and executes the reboot command.`,
+		Args: cobra.ExactArgs(1),
 		Example: `  # Reboot a specific node
-  ocp node reboot worker-2
-
-  # Reboot nodes that match a regex
-  ocp node reboot '^worker-.*'`,
+  ocp node reboot worker-2`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
-			return runSSHCommand(cmd.Context(), user, identityFile, pattern, []string{"sudo reboot"}, cmd)
+			nodeName := args[0]
+			return runSSHCommand(cmd.Context(), user, identityFile, nodeName, []string{"sudo reboot"}, cmd)
 		},
 	}
 
@@ -409,7 +390,7 @@ func newNodeRebootCommand() *cobra.Command {
 
 func newNodeCordonCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:               "cordon <node-pattern>",
+		Use:               "cordon <node-name>",
 		ValidArgsFunction: completeNodeNames,
 		Short:             "Mark node as unschedulable",
 		Long: `Mark a node as unschedulable to prevent new pods from being scheduled on it.
@@ -418,14 +399,14 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 		Example: `  # Prevent new pods from scheduling on a node (annotation will be added automatically)
   ocp node cordon master-0`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
+			node, err := findNodeByName(ctx, nodeName)
 			if err != nil {
 				return err
 			}
@@ -470,7 +451,7 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 
 func newNodeDrainCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:               "drain <node-pattern>",
+		Use:               "drain <node-name>",
 		ValidArgsFunction: completeNodeNames,
 		Short:             "Drain a node (cordon + evict pods)",
 		Long: `Drain a node by marking it as unschedulable and evicting all pods.
@@ -479,14 +460,14 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 		Example: `  # Drain a node (annotation will be added automatically)
   ocp node drain worker-3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
+			node, err := findNodeByName(ctx, nodeName)
 			if err != nil {
 				return err
 			}
@@ -570,22 +551,23 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 
 func newNodeUncordonCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:               "uncordon <node-pattern>",
+		Use:   "uncordon <node-name>",
+		Short: "Mark a node as schedulable",
+		Long: `Mark a node as schedulable, allowing new pods to be scheduled on it.
+The command will automatically remove the annotation "node.dana.io/reason" before uncordoning.`,
 		ValidArgsFunction: completeNodeNames,
-		Short:             "Mark node as schedulable and remove maintenance annotation",
-		Long:              `Mark a node as schedulable and remove the "node.dana.io/reason" annotation. The annotation will be removed first, then the node will be uncordoned.`,
 		Args:              cobra.ExactArgs(1),
-		Example: `  # Remove the maintenance annotation and allow scheduling
+		Example: `  # Uncordon a node (annotation will be removed automatically)
   ocp node uncordon worker-3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
+			node, err := findNodeByName(ctx, nodeName)
 			if err != nil {
 				return err
 			}
@@ -628,7 +610,7 @@ func newNodeUncordonCommand() *cobra.Command {
 
 func newNodeAnnotateCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use: "annotate <node-pattern> <annotation>",
+		Use: "annotate <node-name> <annotation>",
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			// Complete node names for the first argument
 			if len(args) == 0 {
@@ -638,7 +620,7 @@ func newNodeAnnotateCommand() *cobra.Command {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		},
 		Short: "Add or update an annotation on a node",
-		Long: `Add or update annotations on a node matching the pattern.
+		Long: `Add or update annotations on a node by name.
 Annotations should be in the format "key=value" or "key" (to remove).
 Multiple annotations can be specified separated by commas (no spaces).
 
@@ -656,7 +638,7 @@ Examples:
   # Remove an annotation
   ocp node annotate worker-2 purpose`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 			annotationsStr := args[1]
 
 			ctx := cmd.Context()
@@ -664,7 +646,7 @@ Examples:
 				ctx = context.Background()
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
+			node, err := findNodeByName(ctx, nodeName)
 			if err != nil {
 				return err
 			}
@@ -760,7 +742,7 @@ Examples:
 
 func newNodeLabelCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use: "label <node-pattern> <label>",
+		Use: "label <node-name> <label>",
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			// Complete node names for the first argument
 			if len(args) == 0 {
@@ -770,7 +752,7 @@ func newNodeLabelCommand() *cobra.Command {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		},
 		Short: "Add or update a label on a node",
-		Long: `Add or update labels on a node matching the pattern.
+		Long: `Add or update labels on a node by name.
 Labels should be in the format "key=value" or "key-" (to remove).
 Multiple labels can be specified separated by commas (no spaces).
 
@@ -788,7 +770,7 @@ Examples:
   # Remove a label
   ocp node label worker-1 zone-`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pattern := args[0]
+			nodeName := args[0]
 			labelsStr := args[1]
 
 			ctx := cmd.Context()
@@ -796,7 +778,7 @@ Examples:
 				ctx = context.Background()
 			}
 
-			node, err := findNodeByPattern(ctx, pattern)
+			node, err := findNodeByName(ctx, nodeName)
 			if err != nil {
 				return err
 			}
@@ -1036,50 +1018,19 @@ func getPodRestarts(pod *corev1.Pod) string {
 	return fmt.Sprintf("%d", totalRestarts)
 }
 
-// findNodeByPattern finds a node matching the regex pattern
-func findNodeByPattern(ctx context.Context, pattern string) (*corev1.Node, error) {
+// findNodeByName finds a node by exact name match
+func findNodeByName(ctx context.Context, nodeName string) (*corev1.Node, error) {
 	clientset, err := kube.NewClientset(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
-	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list nodes: %w", err)
+		return nil, fmt.Errorf("failed to get node %q: %w", nodeName, err)
 	}
 
-	// Try exact match first (common case, faster)
-	for i := range nodes.Items {
-		if nodes.Items[i].Name == pattern {
-			return &nodes.Items[i], nil
-		}
-	}
-
-	// If not exact match, try regex
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return nil, fmt.Errorf("invalid node pattern %q: %w", pattern, err)
-	}
-
-	var matches []*corev1.Node
-	for i := range nodes.Items {
-		if re.MatchString(nodes.Items[i].Name) {
-			matches = append(matches, &nodes.Items[i])
-		}
-	}
-
-	switch len(matches) {
-	case 0:
-		return nil, fmt.Errorf("no node matched pattern %q", pattern)
-	case 1:
-		return matches[0], nil
-	default:
-		names := make([]string, 0, len(matches))
-		for _, node := range matches {
-			names = append(names, node.Name)
-		}
-		return nil, fmt.Errorf("pattern matched multiple nodes: %s", strings.Join(names, ", "))
-	}
+	return node, nil
 }
 
 // getNodeRoles returns a comma-separated list of node roles

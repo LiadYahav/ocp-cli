@@ -91,3 +91,59 @@ func completeMCPActions(cmd *cobra.Command, args []string, toComplete string) ([
 	}
 	return completions, cobra.ShellCompDirectiveNoFileComp
 }
+
+// completeSchedulableNodes returns only schedulable nodes (not cordoned)
+func completeSchedulableNodes(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	completions := make([]string, 0)
+	for _, node := range nodes.Items {
+		// Only include schedulable nodes (not cordoned)
+		if !node.Spec.Unschedulable && strings.HasPrefix(node.Name, toComplete) {
+			completions = append(completions, node.Name)
+		}
+	}
+
+	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+// completeUnschedulableNodes returns only unschedulable nodes (cordoned)
+func completeUnschedulableNodes(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	completions := make([]string, 0)
+	for _, node := range nodes.Items {
+		// Only include unschedulable nodes (cordoned)
+		if node.Spec.Unschedulable && strings.HasPrefix(node.Name, toComplete) {
+			completions = append(completions, node.Name)
+		}
+	}
+
+	return completions, cobra.ShellCompDirectiveNoFileComp
+}

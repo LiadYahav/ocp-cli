@@ -413,7 +413,7 @@ Use --max-retries to customize the number of retry attempts.`,
 func newNodeCordonCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:               "cordon <node-name>",
-		ValidArgsFunction: completeNodeNames,
+		ValidArgsFunction: completeSchedulableNodes,
 		Short:             "Mark node as unschedulable",
 		Long: `Mark a node as unschedulable to prevent new pods from being scheduled on it.
 The command will automatically add the annotation "node.dana.io/reason: Maintenance" before cordoning.`,
@@ -476,7 +476,7 @@ func newNodeDrainCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:               "drain <node-name>",
-		ValidArgsFunction: completeNodeNames,
+		ValidArgsFunction: completeSchedulableNodes,
 		Short:             "Drain a node (cordon + evict pods)",
 		Long: `Drain a node by marking it as unschedulable and evicting all pods.
 The command will automatically add the annotation "node.dana.io/reason: Maintenance" before draining.
@@ -663,12 +663,12 @@ to control the number of concurrent evictions (default: 5).`,
 
 func newNodeUncordonCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "uncordon <node-name>",
-		Short: "Mark a node as schedulable",
+		Use:               "uncordon <node-name>",
+		ValidArgsFunction: completeUnschedulableNodes,
+		Short:             "Mark a node as schedulable",
 		Long: `Mark a node as schedulable, allowing new pods to be scheduled on it.
 The command will automatically remove the annotation "node.dana.io/reason" before uncordoning.`,
-		ValidArgsFunction: completeNodeNames,
-		Args:              cobra.ExactArgs(1),
+		Args: cobra.ExactArgs(1),
 		Example: `  # Uncordon a node (annotation will be removed automatically)
   ocp node uncordon worker-3`,
 		RunE: func(cmd *cobra.Command, args []string) error {

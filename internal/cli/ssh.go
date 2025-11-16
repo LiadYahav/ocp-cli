@@ -169,6 +169,15 @@ func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, com
 	// Disable strict host key checking to avoid prompts for new hosts
 	sshArgs = append(sshArgs, "-o", "StrictHostKeyChecking=no")
 
+	// Set connection timeout to 3 seconds - only applies to initial connection, not command execution
+	sshArgs = append(sshArgs, "-o", "ConnectTimeout=3")
+
+	// Add server alive options to detect dead connections during long-running commands
+	// ServerAliveInterval: send keepalive every 5 seconds
+	// ServerAliveCountMax: disconnect if 2 keepalives fail (total ~10 seconds to detect dead connection)
+	sshArgs = append(sshArgs, "-o", "ServerAliveInterval=5")
+	sshArgs = append(sshArgs, "-o", "ServerAliveCountMax=2")
+
 	if resolvedIdentityFile != "" {
 		sshArgs = append(sshArgs, "-i", resolvedIdentityFile)
 	}

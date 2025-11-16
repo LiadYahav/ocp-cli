@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -366,24 +367,45 @@ func newNodeYamlCommand() *cobra.Command {
 func newNodeRebootCommand() *cobra.Command {
 	var user string
 	var identityFile string
+	var maxRetries int
 
 	cmd := &cobra.Command{
 		Use:               "reboot <node-name>",
 		ValidArgsFunction: completeNodeNames,
 		Short:             "Reboot a node via SSH",
 		Long: `Reboot a node by SSHing into it and running 'sudo reboot'.
-This command connects to the specified node by name and executes the reboot command.`,
+This command connects to the specified node by name and executes the reboot command.
+
+The command will automatically retry failed SSH connections (default: 3 retries).
+Use --max-retries to customize the number of retry attempts.`,
 		Args: cobra.ExactArgs(1),
 		Example: `  # Reboot a specific node
-  ocp node reboot worker-2`,
+  ocp node reboot worker-2
+
+  # Reboot with custom retry count
+  ocp node reboot worker-2 --max-retries 5`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nodeName := args[0]
-			return runSSHCommand(cmd.Context(), user, identityFile, nodeName, []string{"sudo reboot"}, cmd)
+
+			// Use retry logic for SSH commands
+			if maxRetries <= 0 {
+				maxRetries = 3
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "Rebooting node %s...\n", nodeName)
+			err := runSSHCommandWithRetry(cmd.Context(), user, identityFile, nodeName, []string{"sudo reboot"}, cmd, maxRetries, time.Second)
+			if err != nil {
+				return fmt.Errorf("failed to reboot node %s: %w", nodeName, err)
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "Reboot command sent successfully to node %s\n", nodeName)
+			return nil
 		},
 	}
 
 	cmd.Flags().StringVarP(&user, "user", "u", "core", "Username for SSH connection")
 	cmd.Flags().StringVarP(&identityFile, "identity", "i", "", "Path to private key file for SSH authentication (default: ~/.ssh/id_rsa_ocp if exists)")
+	cmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Maximum number of retry attempts for SSH connection")
 
 	return cmd
 }
@@ -450,15 +472,23 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 }
 
 func newNodeDrainCommand() *cobra.Command {
+	var maxConcurrency int
+
 	cmd := &cobra.Command{
 		Use:               "drain <node-name>",
 		ValidArgsFunction: completeNodeNames,
 		Short:             "Drain a node (cordon + evict pods)",
 		Long: `Drain a node by marking it as unschedulable and evicting all pods.
-The command will automatically add the annotation "node.dana.io/reason: Maintenance" before draining.`,
+The command will automatically add the annotation "node.dana.io/reason: Maintenance" before draining.
+
+Pod evictions are performed concurrently for better performance. Use --max-concurrency
+to control the number of concurrent evictions (default: 5).`,
 		Args: cobra.ExactArgs(1),
 		Example: `  # Drain a node (annotation will be added automatically)
-  ocp node drain worker-3`,
+  ocp node drain worker-3
+
+  # Drain with custom concurrency
+  ocp node drain worker-3 --max-concurrency 10`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nodeName := args[0]
 
@@ -511,6 +541,19 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 				return fmt.Errorf("failed to list pods on node %q: %w", node.Name, err)
 			}
 
+			// Set default concurrency
+			if maxConcurrency <= 0 {
+				maxConcurrency = 5
+			}
+
+			// Filter out DaemonSet pods first
+			type podToEvict struct {
+				namespace string
+				name      string
+			}
+			var podsToEvict []podToEvict
+			var skippedCount int
+
 			for _, pod := range pods.Items {
 				// Skip DaemonSet pods
 				if pod.OwnerReferences != nil {
@@ -522,30 +565,99 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 						}
 					}
 					if isDaemonSet {
-						fmt.Fprintf(cmd.OutOrStdout(), "Skipping DaemonSet pod %s/%s\n", pod.Namespace, pod.Name)
+						fmt.Fprintf(cmd.OutOrStdout(), "⊘ Skipping DaemonSet pod %s/%s\n", pod.Namespace, pod.Name)
+						skippedCount++
 						continue
 					}
 				}
+				podsToEvict = append(podsToEvict, podToEvict{namespace: pod.Namespace, name: pod.Name})
+			}
 
-				eviction := &policyv1.Eviction{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      pod.Name,
-						Namespace: pod.Namespace,
-					},
-				}
+			// Use worker pool pattern for concurrent evictions
+			type evictionResult struct {
+				podNamespace string
+				podName      string
+				err          error
+			}
 
-				err := clientset.CoreV1().Pods(pod.Namespace).EvictV1(ctx, eviction)
-				if err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to evict pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
+			podChan := make(chan podToEvict, len(podsToEvict))
+			resultChan := make(chan evictionResult, len(podsToEvict))
+
+			// Send all pods to evict to the channel
+			for _, pod := range podsToEvict {
+				podChan <- pod
+			}
+			close(podChan)
+
+			// Start worker goroutines
+			var wg sync.WaitGroup
+			for i := 0; i < maxConcurrency; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for pod := range podChan {
+						eviction := &policyv1.Eviction{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      pod.name,
+								Namespace: pod.namespace,
+							},
+						}
+
+						err := clientset.CoreV1().Pods(pod.namespace).EvictV1(ctx, eviction)
+						resultChan <- evictionResult{
+							podNamespace: pod.namespace,
+							podName:      pod.name,
+							err:          err,
+						}
+					}
+				}()
+			}
+
+			// Wait for all workers to finish
+			go func() {
+				wg.Wait()
+				close(resultChan)
+			}()
+
+			// Collect results
+			var evictedCount int
+			var failedCount int
+			var failedPods []string
+
+			for result := range resultChan {
+				if result.err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "✗ Failed to evict pod %s/%s: %v\n", result.podNamespace, result.podName, result.err)
+					failedCount++
+					failedPods = append(failedPods, fmt.Sprintf("%s/%s", result.podNamespace, result.podName))
 				} else {
-					fmt.Fprintf(cmd.OutOrStdout(), "Evicted pod %s/%s\n", pod.Namespace, pod.Name)
+					fmt.Fprintf(cmd.OutOrStdout(), "✓ Evicted pod %s/%s\n", result.podNamespace, result.podName)
+					evictedCount++
 				}
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Node %q drained successfully\n", node.Name)
+			// Print summary
+			fmt.Fprintf(cmd.OutOrStdout(), "\n=== Summary ===\n")
+			fmt.Fprintf(cmd.OutOrStdout(), "Node: %s\n", node.Name)
+			fmt.Fprintf(cmd.OutOrStdout(), "Total pods found: %d\n", len(pods.Items))
+			fmt.Fprintf(cmd.OutOrStdout(), "Pods evicted: %d\n", evictedCount)
+			fmt.Fprintf(cmd.OutOrStdout(), "Pods skipped (DaemonSet): %d\n", skippedCount)
+			fmt.Fprintf(cmd.OutOrStdout(), "Pods failed to evict: %d\n", failedCount)
+
+			if failedCount > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "\n✗ Failed to evict pods:\n")
+				for _, podName := range failedPods {
+					fmt.Fprintf(cmd.ErrOrStderr(), "  - %s\n", podName)
+				}
+				return fmt.Errorf("drain completed with %d failed pod eviction(s)", failedCount)
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "\n✓ Node %q drained successfully\n", node.Name)
 			return nil
 		},
 	}
+
+	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 5, "Maximum number of concurrent pod evictions")
+
 	return cmd
 }
 
@@ -728,10 +840,20 @@ Examples:
 
 			// Print results
 			if len(removedKeys) > 0 {
-				fmt.Fprintf(cmd.OutOrStdout(), "Removed annotation(s) %v from node %q\n", removedKeys, node.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "✓ Removed annotation(s) %v from node %q\n", removedKeys, node.Name)
 			}
 			if len(addedKeys) > 0 {
-				fmt.Fprintf(cmd.OutOrStdout(), "Added annotation(s) %v to node %q\n", addedKeys, node.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "✓ Added annotation(s) %v to node %q\n", addedKeys, node.Name)
+			}
+
+			// Print summary
+			fmt.Fprintf(cmd.OutOrStdout(), "\n=== Summary ===\n")
+			fmt.Fprintf(cmd.OutOrStdout(), "Node: %s\n", node.Name)
+			fmt.Fprintf(cmd.OutOrStdout(), "Annotations added/updated: %d\n", len(addedKeys))
+			fmt.Fprintf(cmd.OutOrStdout(), "Annotations removed: %d\n", len(removedKeys))
+			fmt.Fprintf(cmd.OutOrStdout(), "Total operations: %d\n", len(addedKeys)+len(removedKeys))
+			if len(addedKeys) > 0 || len(removedKeys) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "\n✓ Annotation operation completed successfully\n")
 			}
 
 			return nil
@@ -865,10 +987,20 @@ Examples:
 
 			// Print results
 			if len(removedKeys) > 0 {
-				fmt.Fprintf(cmd.OutOrStdout(), "Removed label(s) %v from node %q\n", removedKeys, node.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "✓ Removed label(s) %v from node %q\n", removedKeys, node.Name)
 			}
 			if len(addedKeys) > 0 {
-				fmt.Fprintf(cmd.OutOrStdout(), "Added label(s) %v to node %q\n", addedKeys, node.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "✓ Added label(s) %v to node %q\n", addedKeys, node.Name)
+			}
+
+			// Print summary
+			fmt.Fprintf(cmd.OutOrStdout(), "\n=== Summary ===\n")
+			fmt.Fprintf(cmd.OutOrStdout(), "Node: %s\n", node.Name)
+			fmt.Fprintf(cmd.OutOrStdout(), "Labels added/updated: %d\n", len(addedKeys))
+			fmt.Fprintf(cmd.OutOrStdout(), "Labels removed: %d\n", len(removedKeys))
+			fmt.Fprintf(cmd.OutOrStdout(), "Total operations: %d\n", len(addedKeys)+len(removedKeys))
+			if len(addedKeys) > 0 || len(removedKeys) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "\n✓ Label operation completed successfully\n")
 			}
 
 			return nil
@@ -988,6 +1120,11 @@ Examples:
 				fmt.Fprintf(cmd.OutOrStdout(), dataFormat,
 					data.namespace, data.name, data.ready, data.status, data.restarts, data.age)
 			}
+
+			// Print summary
+			fmt.Fprintf(cmd.OutOrStdout(), "\n=== Summary ===\n")
+			fmt.Fprintf(cmd.OutOrStdout(), "Node: %s\n", nodeName)
+			fmt.Fprintf(cmd.OutOrStdout(), "Total pods: %d\n", len(pods.Items))
 
 			return nil
 		},

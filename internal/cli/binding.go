@@ -626,7 +626,13 @@ func addSubjectToRoleBinding(ctx context.Context, clientset *kubernetes.Clientse
 		if err != nil {
 			return fmt.Errorf("failed to create role binding: %w", err)
 		}
-		fmt.Fprintf(out, "Created role binding %q and added %s %q\n", bindingName, subject.Kind, subject.Name)
+		fmt.Fprintf(out, "✓ Created role binding %q and added %s %q\n", bindingName, subject.Kind, subject.Name)
+		fmt.Fprintf(out, "\n=== Summary ===\n")
+		fmt.Fprintf(out, "Operation: Created new role binding\n")
+		fmt.Fprintf(out, "Binding: %s (namespace: %s)\n", bindingName, namespace)
+		fmt.Fprintf(out, "Role: %s\n", roleName)
+		fmt.Fprintf(out, "Subject added: %s %q\n", subject.Kind, subject.Name)
+		fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 		return nil
 	}
 
@@ -642,7 +648,12 @@ func addSubjectToRoleBinding(ctx context.Context, clientset *kubernetes.Clientse
 	// Check if subject already exists
 	for _, s := range binding.Subjects {
 		if s.Kind == subject.Kind && s.Name == subject.Name && s.Namespace == subject.Namespace {
-			fmt.Fprintf(out, "%s %q already has role %q in namespace %q\n", subject.Kind, subject.Name, roleName, namespace)
+			fmt.Fprintf(out, "⊘ %s %q already has role %q in namespace %q\n", subject.Kind, subject.Name, roleName, namespace)
+			fmt.Fprintf(out, "\n=== Summary ===\n")
+			fmt.Fprintf(out, "Operation: No change needed\n")
+			fmt.Fprintf(out, "Binding: %s (namespace: %s)\n", bindingName, namespace)
+			fmt.Fprintf(out, "Role: %s\n", roleName)
+			fmt.Fprintf(out, "Subject: %s %q (already exists)\n", subject.Kind, subject.Name)
 			return nil
 		}
 	}
@@ -654,7 +665,14 @@ func addSubjectToRoleBinding(ctx context.Context, clientset *kubernetes.Clientse
 		return fmt.Errorf("failed to update role binding: %w", err)
 	}
 
-	fmt.Fprintf(out, "Added %s %q to role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "✓ Added %s %q to role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Operation: Updated existing role binding\n")
+	fmt.Fprintf(out, "Binding: %s (namespace: %s)\n", bindingName, namespace)
+	fmt.Fprintf(out, "Role: %s\n", roleName)
+	fmt.Fprintf(out, "Subject added: %s %q\n", subject.Kind, subject.Name)
+	fmt.Fprintf(out, "Total subjects in binding: %d\n", len(binding.Subjects))
+	fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 	return nil
 }
 
@@ -682,7 +700,13 @@ func addSubjectToClusterRoleBinding(ctx context.Context, clientset *kubernetes.C
 		if err != nil {
 			return fmt.Errorf("failed to create cluster role binding: %w", err)
 		}
-		fmt.Fprintf(out, "Created cluster role binding %q and added %s %q\n", bindingName, subject.Kind, subject.Name)
+		fmt.Fprintf(out, "✓ Created cluster role binding %q and added %s %q\n", bindingName, subject.Kind, subject.Name)
+		fmt.Fprintf(out, "\n=== Summary ===\n")
+		fmt.Fprintf(out, "Operation: Created new cluster role binding\n")
+		fmt.Fprintf(out, "Binding: %s\n", bindingName)
+		fmt.Fprintf(out, "Role: %s\n", roleName)
+		fmt.Fprintf(out, "Subject added: %s %q\n", subject.Kind, subject.Name)
+		fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 		return nil
 	}
 
@@ -698,7 +722,12 @@ func addSubjectToClusterRoleBinding(ctx context.Context, clientset *kubernetes.C
 	// Check if subject already exists
 	for _, s := range binding.Subjects {
 		if s.Kind == subject.Kind && s.Name == subject.Name && s.Namespace == subject.Namespace {
-			fmt.Fprintf(out, "%s %q already has cluster role %q\n", subject.Kind, subject.Name, roleName)
+			fmt.Fprintf(out, "⊘ %s %q already has cluster role %q\n", subject.Kind, subject.Name, roleName)
+			fmt.Fprintf(out, "\n=== Summary ===\n")
+			fmt.Fprintf(out, "Operation: No change needed\n")
+			fmt.Fprintf(out, "Binding: %s\n", bindingName)
+			fmt.Fprintf(out, "Role: %s\n", roleName)
+			fmt.Fprintf(out, "Subject: %s %q (already exists)\n", subject.Kind, subject.Name)
 			return nil
 		}
 	}
@@ -710,7 +739,14 @@ func addSubjectToClusterRoleBinding(ctx context.Context, clientset *kubernetes.C
 		return fmt.Errorf("failed to update cluster role binding: %w", err)
 	}
 
-	fmt.Fprintf(out, "Added %s %q to cluster role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "✓ Added %s %q to cluster role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Operation: Updated existing cluster role binding\n")
+	fmt.Fprintf(out, "Binding: %s\n", bindingName)
+	fmt.Fprintf(out, "Role: %s\n", roleName)
+	fmt.Fprintf(out, "Subject added: %s %q\n", subject.Kind, subject.Name)
+	fmt.Fprintf(out, "Total subjects in binding: %d\n", len(binding.Subjects))
+	fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 	return nil
 }
 
@@ -723,6 +759,11 @@ func removeSubjectFromRoleBinding(ctx context.Context, clientset *kubernetes.Cli
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get role binding: %w", err)
+	}
+
+	// Verify role ref matches
+	if binding.RoleRef.Name != roleName {
+		return fmt.Errorf("role binding %q references role %q, not %q", bindingName, binding.RoleRef.Name, roleName)
 	}
 
 	// Find and remove subject
@@ -746,7 +787,13 @@ func removeSubjectFromRoleBinding(ctx context.Context, clientset *kubernetes.Cli
 		if err != nil {
 			return fmt.Errorf("failed to delete empty role binding: %w", err)
 		}
-		fmt.Fprintf(out, "Removed %s %q from role binding %q (binding deleted as it became empty)\n", subject.Kind, subject.Name, bindingName)
+		fmt.Fprintf(out, "✓ Removed %s %q from role binding %q (binding deleted as it became empty)\n", subject.Kind, subject.Name, bindingName)
+		fmt.Fprintf(out, "\n=== Summary ===\n")
+		fmt.Fprintf(out, "Operation: Removed subject and deleted empty binding\n")
+		fmt.Fprintf(out, "Binding: %s (namespace: %s)\n", bindingName, namespace)
+		fmt.Fprintf(out, "Role: %s\n", roleName)
+		fmt.Fprintf(out, "Subject removed: %s %q\n", subject.Kind, subject.Name)
+		fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 		return nil
 	}
 
@@ -757,7 +804,14 @@ func removeSubjectFromRoleBinding(ctx context.Context, clientset *kubernetes.Cli
 		return fmt.Errorf("failed to update role binding: %w", err)
 	}
 
-	fmt.Fprintf(out, "Removed %s %q from role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "✓ Removed %s %q from role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Operation: Removed subject from role binding\n")
+	fmt.Fprintf(out, "Binding: %s (namespace: %s)\n", bindingName, namespace)
+	fmt.Fprintf(out, "Role: %s\n", roleName)
+	fmt.Fprintf(out, "Subject removed: %s %q\n", subject.Kind, subject.Name)
+	fmt.Fprintf(out, "Remaining subjects in binding: %d\n", len(newSubjects))
+	fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 	return nil
 }
 
@@ -770,6 +824,11 @@ func removeSubjectFromClusterRoleBinding(ctx context.Context, clientset *kuberne
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get cluster role binding: %w", err)
+	}
+
+	// Verify role ref matches
+	if binding.RoleRef.Name != roleName {
+		return fmt.Errorf("cluster role binding %q references role %q, not %q", bindingName, binding.RoleRef.Name, roleName)
 	}
 
 	// Find and remove subject
@@ -793,7 +852,13 @@ func removeSubjectFromClusterRoleBinding(ctx context.Context, clientset *kuberne
 		if err != nil {
 			return fmt.Errorf("failed to delete empty cluster role binding: %w", err)
 		}
-		fmt.Fprintf(out, "Removed %s %q from cluster role binding %q (binding deleted as it became empty)\n", subject.Kind, subject.Name, bindingName)
+		fmt.Fprintf(out, "✓ Removed %s %q from cluster role binding %q (binding deleted as it became empty)\n", subject.Kind, subject.Name, bindingName)
+		fmt.Fprintf(out, "\n=== Summary ===\n")
+		fmt.Fprintf(out, "Operation: Removed subject and deleted empty binding\n")
+		fmt.Fprintf(out, "Binding: %s\n", bindingName)
+		fmt.Fprintf(out, "Role: %s\n", roleName)
+		fmt.Fprintf(out, "Subject removed: %s %q\n", subject.Kind, subject.Name)
+		fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 		return nil
 	}
 
@@ -804,7 +869,14 @@ func removeSubjectFromClusterRoleBinding(ctx context.Context, clientset *kuberne
 		return fmt.Errorf("failed to update cluster role binding: %w", err)
 	}
 
-	fmt.Fprintf(out, "Removed %s %q from cluster role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "✓ Removed %s %q from cluster role binding %q\n", subject.Kind, subject.Name, bindingName)
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Operation: Removed subject from cluster role binding\n")
+	fmt.Fprintf(out, "Binding: %s\n", bindingName)
+	fmt.Fprintf(out, "Role: %s\n", roleName)
+	fmt.Fprintf(out, "Subject removed: %s %q\n", subject.Kind, subject.Name)
+	fmt.Fprintf(out, "Remaining subjects in binding: %d\n", len(newSubjects))
+	fmt.Fprintf(out, "\n✓ Binding operation completed successfully\n")
 	return nil
 }
 

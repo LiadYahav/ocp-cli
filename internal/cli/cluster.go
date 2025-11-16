@@ -7,6 +7,7 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -156,6 +157,8 @@ func newClusterWatchCommand() *cobra.Command {
 func newClusterConfigureDNSCommand() *cobra.Command {
 	var user string
 	var identityFile string
+	var maxConcurrency int
+	var maxRetries int
 
 	cmd := &cobra.Command{
 		Use:   "configure-dns <nameservers>",
@@ -168,7 +171,10 @@ func newClusterConfigureDNSCommand() *cobra.Command {
   ocp cluster configure-dns 1.1.1.1
 
   # Override DNS on all nodes with two nameservers
-  ocp cluster configure-dns 8.8.8.8,8.8.4.4`,
+  ocp cluster configure-dns 8.8.8.8,8.8.4.4
+
+  # Configure with custom concurrency and retries
+  ocp cluster configure-dns 8.8.8.8 --max-concurrency 10 --max-retries 5`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -204,21 +210,86 @@ func newClusterConfigureDNSCommand() *cobra.Command {
 				mode = dnsModeAppend
 			}
 
+			// Set defaults
+			if maxConcurrency <= 0 {
+				maxConcurrency = 10
+			}
+			if maxRetries <= 0 {
+				maxRetries = 3
+			}
+
+			// Use a worker pool pattern for concurrency
+			type nodeResult struct {
+				nodeName string
+				err      error
+			}
+
+			nodeChan := make(chan string, len(nodes.Items))
+			resultChan := make(chan nodeResult, len(nodes.Items))
+
+			// Send all node names to the channel
 			for _, node := range nodes.Items {
-				fmt.Fprintf(cmd.OutOrStdout(), "Configuring DNS on %s...\n", node.Name)
-				script := buildDNSConfigureScript(nameservers, mode)
-				if err := runSSHCommand(ctx, user, identityFile, node.Name, []string{script}, cmd); err != nil {
-					return fmt.Errorf("failed to configure DNS on node %s: %w", node.Name, err)
+				nodeChan <- node.Name
+			}
+			close(nodeChan)
+
+			// Start worker goroutines
+			var wg sync.WaitGroup
+			for i := 0; i < maxConcurrency; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for nodeName := range nodeChan {
+						fmt.Fprintf(cmd.OutOrStdout(), "Configuring DNS on %s...\n", nodeName)
+						script := buildDNSConfigureScript(nameservers, mode)
+						err := runSSHCommandWithRetry(ctx, user, identityFile, nodeName, []string{script}, cmd, maxRetries, time.Second)
+						resultChan <- nodeResult{nodeName: nodeName, err: err}
+					}
+				}()
+			}
+
+			// Wait for all workers to finish
+			go func() {
+				wg.Wait()
+				close(resultChan)
+			}()
+
+			// Collect results and report errors
+			var failedNodes []string
+			var successCount int
+			for result := range resultChan {
+				if result.err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "✗ Error: failed to configure DNS on node %s: %v\n", result.nodeName, result.err)
+					failedNodes = append(failedNodes, result.nodeName)
+				} else {
+					successCount++
+					fmt.Fprintf(cmd.OutOrStdout(), "✓ Successfully configured DNS on %s\n", result.nodeName)
 				}
 			}
 
-			fmt.Fprintln(cmd.OutOrStdout(), "DNS configuration updated on all nodes.")
+			// Print summary
+			fmt.Fprintf(cmd.OutOrStdout(), "\n=== Summary ===\n")
+			fmt.Fprintf(cmd.OutOrStdout(), "Total nodes: %d\n", len(nodes.Items))
+			fmt.Fprintf(cmd.OutOrStdout(), "Successful: %d\n", successCount)
+			fmt.Fprintf(cmd.OutOrStdout(), "Failed: %d\n", len(failedNodes))
+
+			if len(failedNodes) > 0 {
+				fmt.Fprintf(cmd.ErrOrStderr(), "\n✗ Failed nodes:\n")
+				for _, nodeName := range failedNodes {
+					fmt.Fprintf(cmd.ErrOrStderr(), "  - %s\n", nodeName)
+				}
+				return fmt.Errorf("failed to configure DNS on %d node(s) out of %d total", len(failedNodes), len(nodes.Items))
+			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "\n✓ DNS configuration updated successfully on all %d node(s).\n", successCount)
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVarP(&user, "user", "u", "core", "Username for SSH connection")
 	cmd.Flags().StringVarP(&identityFile, "identity", "i", "", "Path to private key file for SSH authentication (default: ~/.ssh/id_rsa_ocp if exists)")
+	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 10, "Maximum number of concurrent SSH connections")
+	cmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Maximum number of retry attempts per node")
 
 	return cmd
 }

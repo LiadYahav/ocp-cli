@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -20,6 +21,7 @@ const defaultSSHKeyPath = "~/.ssh/id_rsa_ocp"
 func newSSHCommand() *cobra.Command {
 	var user string
 	var identityFile string
+	var maxRetries int
 
 	cmd := &cobra.Command{
 		Use:   "ssh <node-name> [remote-command...]",
@@ -40,6 +42,9 @@ as remote commands to execute in sequence on the node (like a script).
 By default, the CLI will use ~/.ssh/id_rsa_ocp as the SSH private key if it exists.
 You can override this with the --identity flag.
 
+The command will automatically retry failed SSH connections (default: 3 retries).
+Use --max-retries to customize the number of retry attempts.
+
 Multiple commands can be provided in two ways:
   1. As a single string with semicolons: "cmd1; cmd2; cmd3"
   2. As multiple arguments (auto-joined with "; "): "cmd1" "cmd2" "cmd3"
@@ -54,23 +59,37 @@ Examples:
   # Multiple command arguments (auto-joined)
   ocp ssh node-24 "echo hello" "cat /etc/os-release" "uptime"
   
-  # With identity file
-  ocp ssh -i ~/.ssh/id_rsa master-1 "whoami" "df -h" "free -m"`,
+  # With identity file and custom retries
+  ocp ssh -i ~/.ssh/id_rsa master-1 "whoami" "df -h" "free -m" --max-retries 5`,
 		Args: cobra.MinimumNArgs(1),
 		Example: `  # Open an interactive session
   ocp ssh worker-1
 
   # Run multiple commands sequentially
-  ocp ssh master-0 "whoami" "cat /etc/os-release"`,
+  ocp ssh master-0 "whoami" "cat /etc/os-release"
+
+  # With custom retry count
+  ocp ssh worker-2 "uptime" --max-retries 5`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nodeName := args[0]
 
-			return runSSHCommand(cmd.Context(), user, identityFile, nodeName, args[1:], cmd)
+			// Use retry logic for SSH commands
+			if maxRetries <= 0 {
+				maxRetries = 3
+			}
+
+			err := runSSHCommandWithRetry(cmd.Context(), user, identityFile, nodeName, args[1:], cmd, maxRetries, time.Second)
+			if err != nil {
+				return fmt.Errorf("failed to connect to node %s: %w", nodeName, err)
+			}
+
+			return nil
 		},
 	}
 
 	cmd.Flags().StringVarP(&user, "user", "u", "core", "Username for SSH connection")
 	cmd.Flags().StringVarP(&identityFile, "identity", "i", "", "Path to private key file for SSH authentication (default: ~/.ssh/id_rsa_ocp if exists)")
+	cmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Maximum number of retry attempts for SSH connection")
 
 	return cmd
 }
@@ -168,6 +187,42 @@ func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, com
 	}
 
 	return sshCmd.Run()
+}
+
+// runSSHCommandWithRetry executes an SSH command with retry logic
+// maxRetries: maximum number of retry attempts (default: 3)
+// initialDelay: initial delay between retries (default: 1 second)
+func runSSHCommandWithRetry(ctx context.Context, user, identityFile, nodeName string, commands []string, cobraCmd *cobra.Command, maxRetries int, initialDelay time.Duration) error {
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	if initialDelay <= 0 {
+		initialDelay = time.Second
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: delay = initialDelay * 2^(attempt-1)
+			delay := initialDelay * time.Duration(1<<uint(attempt-1))
+			if cobraCmd != nil {
+				fmt.Fprintf(cobraCmd.ErrOrStderr(), "Retrying SSH to %s (attempt %d/%d) after %v...\n", nodeName, attempt+1, maxRetries+1, delay)
+			}
+			time.Sleep(delay)
+		}
+
+		err := runSSHCommand(ctx, user, identityFile, nodeName, commands, cobraCmd)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+		if cobraCmd != nil {
+			fmt.Fprintf(cobraCmd.ErrOrStderr(), "SSH attempt %d/%d failed for %s: %v\n", attempt+1, maxRetries+1, nodeName, err)
+		}
+	}
+
+	return fmt.Errorf("SSH to %s failed after %d attempts: %w", nodeName, maxRetries+1, lastErr)
 }
 
 func resolveIdentityFile(identityFile string) (string, error) {

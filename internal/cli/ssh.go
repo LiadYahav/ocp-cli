@@ -147,6 +147,9 @@ func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, com
 	target := fmt.Sprintf("%s@%s", user, ip)
 	sshArgs := []string{}
 
+	// Disable strict host key checking to avoid prompts for new hosts
+	sshArgs = append(sshArgs, "-o", "StrictHostKeyChecking=no")
+
 	if resolvedIdentityFile != "" {
 		sshArgs = append(sshArgs, "-i", resolvedIdentityFile)
 	}

@@ -66,6 +66,7 @@ func newGetCommand() *cobra.Command {
 	var namespace string
 	var allNamespaces bool
 	var selector string
+	var showLabels bool
 
 	cmd := &cobra.Command{
 		Use:   "get <resource-type> [resource-name]",
@@ -83,7 +84,13 @@ Examples:
   ocp get pods --all-namespaces
 
   # List resources with label selector
-  ocp get pods -l app=myapp`,
+  ocp get pods -l app=myapp
+
+  # Show pods with wide output (more columns)
+  ocp get pods -owide
+
+  # Show pods with labels
+  ocp get pods --show-labels`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
 				// Complete resource types
@@ -106,7 +113,19 @@ Examples:
   ocp get pods -A
 
   # List with label selector
-  ocp get pods -l app=myapp`,
+  ocp get pods -l app=myapp
+
+  # Show pods with wide output (includes node, IPs)
+  ocp get pods -owide
+
+  # Show pods with labels
+  ocp get pods --show-labels
+
+  # Output as JSON
+  ocp get pods -o json
+
+  # Output as YAML
+  ocp get pods -o yaml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -127,7 +146,7 @@ Examples:
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			return getResource(ctx, clientset, resourceType, resourceName, ns, allNamespaces, selector, output, cmd.OutOrStdout())
+			return getResource(ctx, clientset, resourceType, resourceName, ns, allNamespaces, selector, output, showLabels, cmd.OutOrStdout())
 		},
 	}
 
@@ -135,6 +154,11 @@ Examples:
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
 	cmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "List resources in all namespaces")
 	cmd.Flags().StringVarP(&selector, "selector", "l", "", "Selector (label query) to filter on")
+	cmd.Flags().BoolVar(&showLabels, "show-labels", false, "When printing, show all labels as the last column")
+
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("output", completeOutputFormats)
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
 
 	return cmd
 }
@@ -171,7 +195,16 @@ Examples:
 			}
 
 			if len(fileFlag) == 0 {
-				return fmt.Errorf("must specify -f or --filename")
+				cmd.PrintErrln("Error: must specify -f or --filename")
+				cmd.PrintErrln()
+				cmd.PrintErrln("Usage:")
+				cmd.PrintErrln("  ocp create -f <file>")
+				cmd.PrintErrln()
+				cmd.PrintErrln("Examples:")
+				cmd.PrintErrln("  ocp create -f deployment.yaml")
+				cmd.PrintErrln("  ocp create -f file1.yaml -f file2.yaml")
+				cmd.PrintErrln("  cat deployment.yaml | ocp create -f -")
+				return fmt.Errorf("missing required flag: -f or --filename")
 			}
 
 			ns := resolveNamespace(ctx, namespace, false)
@@ -192,6 +225,9 @@ Examples:
 
 	cmd.Flags().StringSliceP("filename", "f", []string{}, "Filename, directory, or URL to files to use to create the resource")
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
 
 	return cmd
 }
@@ -253,6 +289,9 @@ Examples:
 
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
 
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+
 	return cmd
 }
 
@@ -294,7 +333,10 @@ Examples:
   ocp delete pods -l app=myapp
 
   # Delete multiple resources
-  ocp delete pod pod1 pod2 pod3`,
+  ocp delete pod pod1 pod2 pod3
+
+  # Force delete (immediate removal)
+  ocp delete pod my-pod --force`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -330,6 +372,9 @@ Examples:
 	cmd.Flags().BoolVar(&force, "force", false, "Immediately remove resources from API and bypass graceful deletion")
 	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 10, "Maximum number of concurrent deletions")
 
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+
 	return cmd
 }
 
@@ -362,7 +407,13 @@ Examples:
   ocp describe pod my-pod
 
   # Describe a deployment
-  ocp describe deployment my-app`,
+  ocp describe deployment my-app
+
+  # Describe a node
+  ocp describe node worker-0
+
+  # Describe a service
+  ocp describe service my-svc`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -389,6 +440,9 @@ Examples:
 
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
 	cmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Describe resources in all namespaces")
+
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
 
 	return cmd
 }
@@ -429,7 +483,16 @@ Examples:
   ocp logs -f my-pod
 
   # Get last 100 lines
-  ocp logs my-pod --tail=100`,
+  ocp logs my-pod --tail=100
+
+  # Get logs from a specific container
+  ocp logs my-pod -c my-container
+
+  # Get logs from previous container instance
+  ocp logs my-pod --previous
+
+  # Get logs since 5 minutes ago
+  ocp logs my-pod --since=5m`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -455,6 +518,9 @@ Examples:
 	cmd.Flags().IntVar(&tailLines, "tail", -1, "Lines of recent log file to display")
 	cmd.Flags().DurationVar(&since, "since", 0, "Only return logs newer than a relative duration like 5s, 2m, or 3h")
 
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+
 	return cmd
 }
 
@@ -478,7 +544,13 @@ Examples:
   ocp apply -f deployment.yaml
 
   # Apply from multiple files
-  ocp apply -f file1.yaml -f file2.yaml`,
+  ocp apply -f file1.yaml -f file2.yaml
+
+  # Apply from stdin
+  cat deployment.yaml | ocp apply -f -
+
+  # Force apply (recreate if necessary)
+  ocp apply -f deployment.yaml --force`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -491,7 +563,16 @@ Examples:
 			}
 
 			if len(fileFlag) == 0 {
-				return fmt.Errorf("must specify -f or --filename")
+				cmd.PrintErrln("Error: must specify -f or --filename")
+				cmd.PrintErrln()
+				cmd.PrintErrln("Usage:")
+				cmd.PrintErrln("  ocp apply -f <file>")
+				cmd.PrintErrln()
+				cmd.PrintErrln("Examples:")
+				cmd.PrintErrln("  ocp apply -f deployment.yaml")
+				cmd.PrintErrln("  ocp apply -f file1.yaml -f file2.yaml")
+				cmd.PrintErrln("  cat deployment.yaml | ocp apply -f -")
+				return fmt.Errorf("missing required flag: -f or --filename")
 			}
 
 			ns := resolveNamespace(ctx, namespace, false)
@@ -513,6 +594,9 @@ Examples:
 	cmd.Flags().StringSliceP("filename", "f", []string{}, "Filename, directory, or URL to files to use to apply the resource")
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
 	cmd.Flags().BoolVar(&force, "force", false, "Force apply, recreate resources if necessary")
+
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
 
 	return cmd
 }
@@ -544,11 +628,17 @@ Examples:
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		},
 		Args: cobra.ExactArgs(2),
-		Example: `  # Patch a pod
+		Example: `  # Patch a pod using strategic merge patch (default)
   ocp patch pod my-pod -p '{"spec":{"containers":[{"name":"my-container","image":"new-image"}]}}'
 
   # Patch from file
-  ocp patch pod my-pod --patch-file patch.yaml`,
+  ocp patch pod my-pod --patch-file patch.yaml
+
+  # Patch using JSON merge patch
+  ocp patch pod my-pod --type=merge -p '{"metadata":{"labels":{"new":"label"}}}'
+
+  # Patch using JSON patch
+  ocp patch pod my-pod --type=json -p '[{"op":"replace","path":"/spec/containers/0/image","value":"new-image"}]'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -560,7 +650,16 @@ Examples:
 			ns := resolveNamespace(ctx, namespace, false)
 
 			if patch == "" && patchFile == "" {
-				return fmt.Errorf("must specify either -p/--patch or --patch-file")
+				cmd.PrintErrln("Error: must specify either -p/--patch or --patch-file")
+				cmd.PrintErrln()
+				cmd.PrintErrln("Usage:")
+				cmd.PrintErrln("  ocp patch <resource-type> <resource-name> -p <patch-string>")
+				cmd.PrintErrln("  ocp patch <resource-type> <resource-name> --patch-file <file>")
+				cmd.PrintErrln()
+				cmd.PrintErrln("Examples:")
+				cmd.PrintErrln("  ocp patch pod my-pod -p '{\"spec\":{\"containers\":[{\"name\":\"my-container\",\"image\":\"new-image\"}]}}'")
+				cmd.PrintErrln("  ocp patch pod my-pod --patch-file patch.yaml")
+				return fmt.Errorf("missing required flag: -p/--patch or --patch-file")
 			}
 
 			clientset, err := kube.NewClientset(ctx)
@@ -582,6 +681,10 @@ Examples:
 	cmd.Flags().StringVar(&patchFile, "patch-file", "", "The file containing the patch to be applied")
 	cmd.Flags().StringVar(&patchType, "type", "strategic", "The type of patch being provided (strategic, merge, json)")
 
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+	_ = cmd.RegisterFlagCompletionFunc("type", completePatchTypes)
+
 	return cmd
 }
 
@@ -597,15 +700,7 @@ func resolveNamespace(ctx context.Context, explicitNS string, allNamespaces bool
 	return getCurrentNamespace(ctx)
 }
 
-func filterCompletions(items []string, prefix string) []string {
-	completions := make([]string, 0)
-	for _, item := range items {
-		if strings.HasPrefix(item, prefix) {
-			completions = append(completions, item)
-		}
-	}
-	return completions
-}
+// filterCompletions is now in completion.go - use that one
 
 func completeResourceNames(cmd *cobra.Command, resourceType string, toComplete string, namespace string, allNamespaces bool) ([]string, cobra.ShellCompDirective) {
 	ctx := cmd.Context()
@@ -662,25 +757,25 @@ func completePodNames(cmd *cobra.Command, toComplete string, namespace string) (
 func normalizeResourceType(resourceType string) string {
 	// Handle common aliases
 	aliasMap := map[string]string{
-		"po":  "pods",
-		"svc": "services",
+		"po":     "pods",
+		"svc":    "services",
 		"deploy": "deployments",
-		"rs":   "replicasets",
-		"sts":  "statefulsets",
-		"ds":   "daemonsets",
-		"cj":   "cronjobs",
-		"cm":   "configmaps",
-		"pvc":  "persistentvolumeclaims",
-		"pv":   "persistentvolumes",
-		"no":   "nodes",
-		"ns":   "namespaces",
-		"ing":  "ingresses",
+		"rs":     "replicasets",
+		"sts":    "statefulsets",
+		"ds":     "daemonsets",
+		"cj":     "cronjobs",
+		"cm":     "configmaps",
+		"pvc":    "persistentvolumeclaims",
+		"pv":     "persistentvolumes",
+		"no":     "nodes",
+		"ns":     "namespaces",
+		"ing":    "ingresses",
 		"netpol": "networkpolicies",
-		"sa":   "serviceaccounts",
-		"rb":   "rolebindings",
-		"crb":  "clusterrolebindings",
-		"cr":   "clusterroles",
-		"pdb":  "poddisruptionbudgets",
+		"sa":     "serviceaccounts",
+		"rb":     "rolebindings",
+		"crb":    "clusterrolebindings",
+		"cr":     "clusterroles",
+		"pdb":    "poddisruptionbudgets",
 	}
 
 	if normalized, ok := aliasMap[resourceType]; ok {
@@ -1027,7 +1122,7 @@ func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, res
 
 // Implementation functions
 
-func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, resourceName string, namespace string, allNamespaces bool, selector string, output string, out io.Writer) error {
+func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, resourceName string, namespace string, allNamespaces bool, selector string, output string, showLabels bool, out io.Writer) error {
 	resourceType = normalizeResourceType(resourceType)
 	opts := metav1.ListOptions{}
 	if selector != "" {
@@ -1058,7 +1153,7 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 		if err != nil {
 			return err
 		}
-		return printResourceList(pods, output, out, allNamespaces)
+		return printResourceList(pods, output, out, allNamespaces, showLabels, resourceType)
 
 	case "services", "svc":
 		var svcs *corev1.ServiceList
@@ -1082,7 +1177,7 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 		if err != nil {
 			return err
 		}
-		return printResourceList(svcs, output, out, allNamespaces)
+		return printResourceList(svcs, output, out, allNamespaces, showLabels, resourceType)
 
 	case "deployments", "deploy":
 		var deploys *appsv1.DeploymentList
@@ -1106,7 +1201,7 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 		if err != nil {
 			return err
 		}
-		return printResourceList(deploys, output, out, allNamespaces)
+		return printResourceList(deploys, output, out, allNamespaces, showLabels, resourceType)
 
 	case "nodes", "no":
 		if resourceName != "" {
@@ -1120,7 +1215,7 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 		if err != nil {
 			return err
 		}
-		return printResourceList(nodes, output, out, false)
+		return printResourceList(nodes, output, out, false, showLabels, resourceType)
 
 	case "namespaces", "ns":
 		if resourceName != "" {
@@ -1134,7 +1229,7 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 		if err != nil {
 			return err
 		}
-		return printResourceList(nss, output, out, false)
+		return printResourceList(nss, output, out, false, showLabels, resourceType)
 
 	default:
 		return fmt.Errorf("resource type %q not yet implemented for get command", resourceType)
@@ -1172,7 +1267,7 @@ func printResource(obj runtime.Object, output string, out io.Writer) error {
 	}
 }
 
-func printResourceList(list runtime.Object, output string, out io.Writer, allNamespaces bool) error {
+func printResourceList(list runtime.Object, output string, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
 	switch output {
 	case "json":
 		encoder := json.NewEncoder(out)
@@ -1203,46 +1298,68 @@ func printResourceList(list runtime.Object, output string, out io.Writer, allNam
 			}
 		}
 		return nil
+	case "wide":
+		// Wide output with more columns
+		return printWideResourceList(list, out, allNamespaces, showLabels, resourceType)
 	default:
-		// Simple table format
-		items, err := meta.ExtractList(list)
-		if err != nil {
-			return err
-		}
-		if len(items) == 0 {
-			fmt.Fprintf(out, "No resources found.\n")
-			return nil
-		}
-		if allNamespaces {
-			fmt.Fprintf(out, "%-20s %-50s %-10s %-10s\n", "NAMESPACE", "NAME", "READY", "STATUS")
-			fmt.Fprintf(out, "%-20s %-50s %-10s %-10s\n", strings.Repeat("-", 20), strings.Repeat("-", 50), strings.Repeat("-", 10), strings.Repeat("-", 10))
-		} else {
-			fmt.Fprintf(out, "%-50s %-10s %-10s\n", "NAME", "READY", "STATUS")
-			fmt.Fprintf(out, "%-50s %-10s %-10s\n", strings.Repeat("-", 50), strings.Repeat("-", 10), strings.Repeat("-", 10))
-		}
-		for _, item := range items {
-			meta, err := meta.Accessor(item)
-			if err != nil {
-				continue
-			}
-			// Try to extract status information based on type
-			status := "Unknown"
-			ready := "-"
-			switch obj := item.(type) {
-			case *corev1.Pod:
-				status = string(obj.Status.Phase)
-				ready = fmt.Sprintf("%d/%d", getReadyContainers(obj), len(obj.Spec.Containers))
-			case *appsv1.Deployment:
-				status = fmt.Sprintf("%d/%d", obj.Status.ReadyReplicas, obj.Status.Replicas)
-				ready = status
-			}
-			if allNamespaces {
-				fmt.Fprintf(out, "%-20s %-50s %-10s %-10s\n", meta.GetNamespace(), meta.GetName(), ready, status)
-			} else {
-				fmt.Fprintf(out, "%-50s %-10s %-10s\n", meta.GetName(), ready, status)
-			}
-		}
+		// Default table format
+		return printDefaultResourceList(list, out, allNamespaces, showLabels, resourceType)
+	}
+}
+
+func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
 		return nil
+	}
+
+	// Use dynamic column width calculation like ocp node info
+	switch resourceType {
+	case "pods", "po":
+		return printPodsTable(items, out, allNamespaces, showLabels, false)
+	case "services", "svc":
+		return printServicesTable(items, out, allNamespaces, showLabels, false)
+	case "deployments", "deploy":
+		return printDeploymentsTable(items, out, allNamespaces, showLabels, false)
+	case "nodes", "no":
+		return printNodesTable(items, out, showLabels, false)
+	case "namespaces", "ns":
+		return printNamespacesTable(items, out, showLabels, false)
+	default:
+		// Fallback to simple format
+		return printSimpleTable(items, out, allNamespaces, showLabels)
+	}
+}
+
+func printWideResourceList(list runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Use dynamic column width calculation like ocp node info
+	switch resourceType {
+	case "pods", "po":
+		return printPodsTable(items, out, allNamespaces, showLabels, true)
+	case "services", "svc":
+		return printServicesTable(items, out, allNamespaces, showLabels, true)
+	case "deployments", "deploy":
+		return printDeploymentsTable(items, out, allNamespaces, showLabels, true)
+	case "nodes", "no":
+		return printNodesTable(items, out, showLabels, true)
+	case "namespaces", "ns":
+		return printNamespacesTable(items, out, showLabels, true)
+	default:
+		// Fallback to simple format
+		return printSimpleTable(items, out, allNamespaces, showLabels)
 	}
 }
 
@@ -1255,6 +1372,929 @@ func getReadyContainers(pod *corev1.Pod) int {
 	}
 	return ready
 }
+
+// Table printing functions with dynamic column widths (like ocp node info)
+
+func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type podData struct {
+		namespace string
+		name      string
+		ready     string
+		status    string
+		restarts  string
+		age       string
+		node      string
+		ip        string
+		nominated string
+		labels    string
+	}
+
+	var podList []podData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"ready":     len("READY"),
+		"status":    len("STATUS"),
+		"restarts":  len("RESTARTS"),
+		"age":       len("AGE"),
+	}
+
+	if wide {
+		widths["node"] = len("NODE")
+		widths["ip"] = len("IP")
+		widths["nominated"] = len("NOMINATED NODE")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	// First pass: collect data and calculate widths
+	for _, item := range items {
+		pod, ok := item.(*corev1.Pod)
+		if !ok {
+			continue
+		}
+
+		ready := fmt.Sprintf("%d/%d", getReadyContainers(pod), len(pod.Spec.Containers))
+		status := string(pod.Status.Phase)
+		restarts := getPodRestarts(pod)
+		age := formatAge(pod.CreationTimestamp.Time)
+
+		data := podData{
+			namespace: pod.Namespace,
+			name:      pod.Name,
+			ready:     ready,
+			status:    status,
+			restarts:  restarts,
+			age:       age,
+		}
+
+		if wide {
+			data.node = pod.Spec.NodeName
+			if data.node == "" {
+				data.node = "<none>"
+			}
+			data.ip = pod.Status.PodIP
+			if data.ip == "" {
+				data.ip = "<none>"
+			}
+			if pod.Spec.NodeName != "" {
+				data.nominated = "<none>"
+			} else {
+				data.nominated = "<none>"
+			}
+		}
+
+		if showLabels {
+			labelPairs := make([]string, 0, len(pod.Labels))
+			for k, v := range pod.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelPairs, ",")
+			if data.labels == "" {
+				data.labels = "<none>"
+			}
+		}
+
+		podList = append(podList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.ready) > widths["ready"] {
+			widths["ready"] = len(data.ready)
+		}
+		if len(data.status) > widths["status"] {
+			widths["status"] = len(data.status)
+		}
+		if len(data.restarts) > widths["restarts"] {
+			widths["restarts"] = len(data.restarts)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.node) > widths["node"] {
+				widths["node"] = len(data.node)
+			}
+			if len(data.ip) > widths["ip"] {
+				widths["ip"] = len(data.ip)
+			}
+			if len(data.nominated) > widths["nominated"] {
+				widths["nominated"] = len(data.nominated)
+			}
+		}
+		if showLabels {
+			if len(data.labels) > widths["labels"] {
+				widths["labels"] = len(data.labels)
+			}
+		}
+	}
+
+	if len(podList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["status"]),
+		fmt.Sprintf("%%-%ds", widths["restarts"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "READY", "STATUS", "RESTARTS", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["ip"]),
+			fmt.Sprintf("%%-%ds", widths["node"]),
+			fmt.Sprintf("%%-%ds", widths["nominated"]))
+		headerParts = append(headerParts, "IP", "NODE", "NOMINATED NODE")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each pod
+	for _, data := range podList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.ready, data.status, data.restarts, data.age)
+		if wide {
+			rowParts = append(rowParts, data.ip, data.node, data.nominated)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printServicesTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type svcData struct {
+		namespace  string
+		name       string
+		typeVal    string
+		clusterIP  string
+		externalIP string
+		ports      string
+		age        string
+		selector   string
+		labels     string
+	}
+
+	var svcList []svcData
+	widths := map[string]int{
+		"namespace":  len("NAMESPACE"),
+		"name":       len("NAME"),
+		"typeVal":    len("TYPE"),
+		"clusterIP":  len("CLUSTER-IP"),
+		"externalIP": len("EXTERNAL-IP"),
+		"ports":      len("PORT(S)"),
+		"age":        len("AGE"),
+	}
+
+	if wide {
+		widths["selector"] = len("SELECTOR")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		svc, ok := item.(*corev1.Service)
+		if !ok {
+			continue
+		}
+
+		ports := make([]string, 0, len(svc.Spec.Ports))
+		for _, port := range svc.Spec.Ports {
+			if port.NodePort > 0 {
+				ports = append(ports, fmt.Sprintf("%d:%d/%s", port.Port, port.NodePort, port.Protocol))
+			} else {
+				ports = append(ports, fmt.Sprintf("%d/%s", port.Port, port.Protocol))
+			}
+		}
+		portsStr := strings.Join(ports, ",")
+		if portsStr == "" {
+			portsStr = "<none>"
+		}
+
+		externalIP := "<none>"
+		if len(svc.Spec.ExternalIPs) > 0 {
+			externalIP = strings.Join(svc.Spec.ExternalIPs, ",")
+		} else if svc.Spec.Type == corev1.ServiceTypeLoadBalancer && len(svc.Status.LoadBalancer.Ingress) > 0 {
+			externalIP = svc.Status.LoadBalancer.Ingress[0].IP
+			if externalIP == "" {
+				externalIP = svc.Status.LoadBalancer.Ingress[0].Hostname
+			}
+		}
+
+		selector := "<none>"
+		if wide && len(svc.Spec.Selector) > 0 {
+			selPairs := make([]string, 0, len(svc.Spec.Selector))
+			for k, v := range svc.Spec.Selector {
+				selPairs = append(selPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			selector = strings.Join(selPairs, ",")
+		}
+
+		labels := "<none>"
+		if showLabels && len(svc.Labels) > 0 {
+			labelPairs := make([]string, 0, len(svc.Labels))
+			for k, v := range svc.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := svcData{
+			namespace:  svc.Namespace,
+			name:       svc.Name,
+			typeVal:    string(svc.Spec.Type),
+			clusterIP:  svc.Spec.ClusterIP,
+			externalIP: externalIP,
+			ports:      portsStr,
+			age:        formatAge(svc.CreationTimestamp.Time),
+			selector:   selector,
+			labels:     labels,
+		}
+
+		svcList = append(svcList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.typeVal) > widths["typeVal"] {
+			widths["typeVal"] = len(data.typeVal)
+		}
+		if len(data.clusterIP) > widths["clusterIP"] {
+			widths["clusterIP"] = len(data.clusterIP)
+		}
+		if len(data.externalIP) > widths["externalIP"] {
+			widths["externalIP"] = len(data.externalIP)
+		}
+		if len(data.ports) > widths["ports"] {
+			widths["ports"] = len(data.ports)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide && len(data.selector) > widths["selector"] {
+			widths["selector"] = len(data.selector)
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(svcList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["typeVal"]),
+		fmt.Sprintf("%%-%ds", widths["clusterIP"]),
+		fmt.Sprintf("%%-%ds", widths["externalIP"]),
+		fmt.Sprintf("%%-%ds", widths["ports"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "TYPE", "CLUSTER-IP", "EXTERNAL-IP", "PORT(S)", "AGE")
+
+	if wide {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["selector"]))
+		headerParts = append(headerParts, "SELECTOR")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each service
+	for _, data := range svcList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.typeVal, data.clusterIP, data.externalIP, data.ports, data.age)
+		if wide {
+			rowParts = append(rowParts, data.selector)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printDeploymentsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type deployData struct {
+		namespace  string
+		name       string
+		ready      string
+		upToDate   string
+		available  string
+		age        string
+		containers string
+		images     string
+		selector   string
+		labels     string
+	}
+
+	var deployList []deployData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"ready":     len("READY"),
+		"upToDate":  len("UP-TO-DATE"),
+		"available": len("AVAILABLE"),
+		"age":       len("AGE"),
+	}
+
+	if wide {
+		widths["containers"] = len("CONTAINERS")
+		widths["images"] = len("IMAGES")
+		widths["selector"] = len("SELECTOR")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		deploy, ok := item.(*appsv1.Deployment)
+		if !ok {
+			continue
+		}
+
+		ready := fmt.Sprintf("%d/%d", deploy.Status.ReadyReplicas, deploy.Status.Replicas)
+		upToDate := fmt.Sprintf("%d", deploy.Status.UpdatedReplicas)
+		available := fmt.Sprintf("%d", deploy.Status.AvailableReplicas)
+
+		containers := "<none>"
+		images := "<none>"
+		selector := "<none>"
+
+		if wide {
+			if len(deploy.Spec.Template.Spec.Containers) > 0 {
+				containerNames := make([]string, 0, len(deploy.Spec.Template.Spec.Containers))
+				imageNames := make([]string, 0, len(deploy.Spec.Template.Spec.Containers))
+				for _, c := range deploy.Spec.Template.Spec.Containers {
+					containerNames = append(containerNames, c.Name)
+					imageNames = append(imageNames, c.Image)
+				}
+				containers = strings.Join(containerNames, ",")
+				images = strings.Join(imageNames, ",")
+			}
+
+			if deploy.Spec.Selector != nil && len(deploy.Spec.Selector.MatchLabels) > 0 {
+				selPairs := make([]string, 0, len(deploy.Spec.Selector.MatchLabels))
+				for k, v := range deploy.Spec.Selector.MatchLabels {
+					selPairs = append(selPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				selector = strings.Join(selPairs, ",")
+			}
+		}
+
+		labels := "<none>"
+		if showLabels && len(deploy.Labels) > 0 {
+			labelPairs := make([]string, 0, len(deploy.Labels))
+			for k, v := range deploy.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := deployData{
+			namespace:  deploy.Namespace,
+			name:       deploy.Name,
+			ready:      ready,
+			upToDate:   upToDate,
+			available:  available,
+			age:        formatAge(deploy.CreationTimestamp.Time),
+			containers: containers,
+			images:     images,
+			selector:   selector,
+			labels:     labels,
+		}
+
+		deployList = append(deployList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.ready) > widths["ready"] {
+			widths["ready"] = len(data.ready)
+		}
+		if len(data.upToDate) > widths["upToDate"] {
+			widths["upToDate"] = len(data.upToDate)
+		}
+		if len(data.available) > widths["available"] {
+			widths["available"] = len(data.available)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.containers) > widths["containers"] {
+				widths["containers"] = len(data.containers)
+			}
+			if len(data.images) > widths["images"] {
+				widths["images"] = len(data.images)
+			}
+			if len(data.selector) > widths["selector"] {
+				widths["selector"] = len(data.selector)
+			}
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(deployList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["upToDate"]),
+		fmt.Sprintf("%%-%ds", widths["available"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "READY", "UP-TO-DATE", "AVAILABLE", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["containers"]),
+			fmt.Sprintf("%%-%ds", widths["images"]),
+			fmt.Sprintf("%%-%ds", widths["selector"]))
+		headerParts = append(headerParts, "CONTAINERS", "IMAGES", "SELECTOR")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each deployment
+	for _, data := range deployList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.ready, data.upToDate, data.available, data.age)
+		if wide {
+			rowParts = append(rowParts, data.containers, data.images, data.selector)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printNodesTable(items []runtime.Object, out io.Writer, showLabels bool, wide bool) error {
+	type nodeData struct {
+		name             string
+		status           string
+		roles            string
+		age              string
+		version          string
+		internalIP       string
+		externalIP       string
+		osImage          string
+		kernelVersion    string
+		containerRuntime string
+		labels           string
+	}
+
+	var nodeList []nodeData
+	widths := map[string]int{
+		"name":    len("NAME"),
+		"status":  len("STATUS"),
+		"roles":   len("ROLES"),
+		"age":     len("AGE"),
+		"version": len("VERSION"),
+	}
+
+	if wide {
+		widths["internalIP"] = len("INTERNAL-IP")
+		widths["externalIP"] = len("EXTERNAL-IP")
+		widths["osImage"] = len("OS-IMAGE")
+		widths["kernelVersion"] = len("KERNEL-VERSION")
+		widths["containerRuntime"] = len("CONTAINER-RUNTIME")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		node, ok := item.(*corev1.Node)
+		if !ok {
+			continue
+		}
+
+		// Get node status
+		var status string
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == corev1.NodeReady {
+				if condition.Status == corev1.ConditionTrue {
+					status = "Ready"
+				} else {
+					status = "NotReady"
+				}
+				break
+			}
+		}
+		if status == "" {
+			status = "Unknown"
+		}
+		if node.Spec.Unschedulable {
+			status += ", SchedulingDisabled"
+		}
+
+		// Get node roles
+		var roles []string
+		const rolePrefix = "node-role.kubernetes.io/"
+		for label := range node.Labels {
+			if strings.HasPrefix(label, rolePrefix) {
+				role := label[len(rolePrefix):]
+				if role != "" {
+					roles = append(roles, role)
+				}
+			}
+		}
+		rolesStr := "<none>"
+		if len(roles) > 0 {
+			rolesStr = strings.Join(roles, ",")
+		}
+
+		// Get IPs
+		var internalIP, externalIP string
+		if wide {
+			internalIP = "<none>"
+			externalIP = "<none>"
+			for _, addr := range node.Status.Addresses {
+				if addr.Type == corev1.NodeInternalIP {
+					internalIP = addr.Address
+				}
+				if addr.Type == corev1.NodeExternalIP {
+					externalIP = addr.Address
+				}
+			}
+		}
+
+		data := nodeData{
+			name:    node.Name,
+			status:  status,
+			roles:   rolesStr,
+			age:     formatAge(node.CreationTimestamp.Time),
+			version: node.Status.NodeInfo.KubeletVersion,
+		}
+
+		if wide {
+			data.internalIP = internalIP
+			data.externalIP = externalIP
+			data.osImage = node.Status.NodeInfo.OSImage
+			data.kernelVersion = node.Status.NodeInfo.KernelVersion
+			data.containerRuntime = node.Status.NodeInfo.ContainerRuntimeVersion
+		}
+
+		if showLabels {
+			labelPairs := make([]string, 0, len(node.Labels))
+			for k, v := range node.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelPairs, ",")
+			if data.labels == "" {
+				data.labels = "<none>"
+			}
+		}
+
+		nodeList = append(nodeList, data)
+
+		// Update widths
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.status) > widths["status"] {
+			widths["status"] = len(data.status)
+		}
+		if len(data.roles) > widths["roles"] {
+			widths["roles"] = len(data.roles)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if len(data.version) > widths["version"] {
+			widths["version"] = len(data.version)
+		}
+		if wide {
+			if len(data.internalIP) > widths["internalIP"] {
+				widths["internalIP"] = len(data.internalIP)
+			}
+			if len(data.externalIP) > widths["externalIP"] {
+				widths["externalIP"] = len(data.externalIP)
+			}
+			if len(data.osImage) > widths["osImage"] {
+				widths["osImage"] = len(data.osImage)
+			}
+			if len(data.kernelVersion) > widths["kernelVersion"] {
+				widths["kernelVersion"] = len(data.kernelVersion)
+			}
+			if len(data.containerRuntime) > widths["containerRuntime"] {
+				widths["containerRuntime"] = len(data.containerRuntime)
+			}
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(nodeList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["status"]),
+		fmt.Sprintf("%%-%ds", widths["roles"]),
+		fmt.Sprintf("%%-%ds", widths["age"]),
+		fmt.Sprintf("%%-%ds", widths["version"]))
+	headerParts = append(headerParts, "NAME", "STATUS", "ROLES", "AGE", "VERSION")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["internalIP"]),
+			fmt.Sprintf("%%-%ds", widths["externalIP"]),
+			fmt.Sprintf("%%-%ds", widths["osImage"]),
+			fmt.Sprintf("%%-%ds", widths["kernelVersion"]),
+			fmt.Sprintf("%%-%ds", widths["containerRuntime"]))
+		headerParts = append(headerParts, "INTERNAL-IP", "EXTERNAL-IP", "OS-IMAGE", "KERNEL-VERSION", "CONTAINER-RUNTIME")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each node
+	for _, data := range nodeList {
+		var rowParts []interface{}
+		rowParts = append(rowParts, data.name, data.status, data.roles, data.age, data.version)
+		if wide {
+			rowParts = append(rowParts, data.internalIP, data.externalIP, data.osImage, data.kernelVersion, data.containerRuntime)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printNamespacesTable(items []runtime.Object, out io.Writer, showLabels bool, wide bool) error {
+	type nsData struct {
+		name   string
+		status string
+		age    string
+		labels string
+	}
+
+	var nsList []nsData
+	widths := map[string]int{
+		"name":   len("NAME"),
+		"status": len("STATUS"),
+		"age":    len("AGE"),
+	}
+
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		ns, ok := item.(*corev1.Namespace)
+		if !ok {
+			continue
+		}
+
+		status := string(ns.Status.Phase)
+		if status == "" {
+			status = "Active"
+		}
+
+		labels := "<none>"
+		if showLabels && len(ns.Labels) > 0 {
+			labelPairs := make([]string, 0, len(ns.Labels))
+			for k, v := range ns.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := nsData{
+			name:   ns.Name,
+			status: status,
+			age:    formatAge(ns.CreationTimestamp.Time),
+			labels: labels,
+		}
+
+		nsList = append(nsList, data)
+
+		// Update widths
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.status) > widths["status"] {
+			widths["status"] = len(data.status)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(nsList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["status"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "STATUS", "AGE")
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each namespace
+	for _, data := range nsList {
+		var rowParts []interface{}
+		rowParts = append(rowParts, data.name, data.status, data.age)
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool) error {
+	// Fallback simple table
+	if len(items) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, "%-20s")
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts, "%-50s", "%-10s", "%-10s")
+	headerParts = append(headerParts, "NAME", "READY", "STATUS")
+
+	if showLabels {
+		formatParts = append(formatParts, "%-50s")
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	for _, item := range items {
+		meta, err := meta.Accessor(item)
+		if err != nil {
+			continue
+		}
+
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, meta.GetNamespace())
+		}
+		rowParts = append(rowParts, meta.GetName(), "-", "Unknown")
+		if showLabels {
+			labelPairs := make([]string, 0, len(meta.GetLabels()))
+			for k, v := range meta.GetLabels() {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels := strings.Join(labelPairs, ",")
+			if labels == "" {
+				labels = "<none>"
+			}
+			rowParts = append(rowParts, labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func toInterfaceSlice(strs []string) []interface{} {
+	result := make([]interface{}, len(strs))
+	for i, s := range strs {
+		result[i] = s
+	}
+	return result
+}
+
+// getPodRestarts is defined in node.go - using that one
 
 func createResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, files []string, namespace string, out io.Writer) error {
 	var createdCount int
@@ -1846,4 +2886,3 @@ func patchResource(ctx context.Context, clientset *kubernetes.Clientset, dynamic
 	fmt.Fprintf(out, "✓ %s/%s patched\n", resourceType, resourceName)
 	return nil
 }
-

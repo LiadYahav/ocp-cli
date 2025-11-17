@@ -21,7 +21,7 @@ func New() *CLI {
 	root := &cobra.Command{
 		Use:           "ocp",
 		Short:         "OCP team CLI",
-		SilenceUsage:  true,  // Don't show usage on error
+		SilenceUsage:  false, // Show usage on error to help users
 		SilenceErrors: false, // Show errors properly
 	}
 

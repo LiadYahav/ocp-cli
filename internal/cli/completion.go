@@ -147,3 +147,65 @@ func completeUnschedulableNodes(cmd *cobra.Command, args []string, toComplete st
 
 	return completions, cobra.ShellCompDirectiveNoFileComp
 }
+
+// completeOutputFormats returns available output formats
+func completeOutputFormats(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	formats := []string{"json", "yaml", "wide", "name"}
+	completions := make([]string, 0, len(formats))
+	for _, format := range formats {
+		if strings.HasPrefix(format, toComplete) {
+			completions = append(completions, format)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+// completeNamespaces returns namespace names matching the prefix
+func completeNamespaces(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	completions := make([]string, 0, len(namespaces.Items))
+	for _, ns := range namespaces.Items {
+		if strings.HasPrefix(ns.Name, toComplete) {
+			completions = append(completions, ns.Name)
+		}
+	}
+
+	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+// completePatchTypes returns available patch types
+func completePatchTypes(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	types := []string{"strategic", "merge", "json"}
+	completions := make([]string, 0, len(types))
+	for _, t := range types {
+		if strings.HasPrefix(t, toComplete) {
+			completions = append(completions, t)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+// filterCompletions filters a slice of strings by prefix
+func filterCompletions(items []string, prefix string) []string {
+	completions := make([]string, 0)
+	for _, item := range items {
+		if strings.HasPrefix(item, prefix) {
+			completions = append(completions, item)
+		}
+	}
+	return completions
+}

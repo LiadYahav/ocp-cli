@@ -62,6 +62,7 @@ var commonResources = []string{
 	"roles",
 	"clusterroles", "cr",
 	"poddisruptionbudgets", "pdb",
+	"machineconfigpools", "mcp",
 }
 
 // Commands are exported individually to be added directly to root
@@ -130,7 +131,13 @@ Examples:
   ocp get pods -o json
 
   # Output as YAML
-  ocp get pods -o yaml`,
+  ocp get pods -o yaml
+
+  # List Machine Config Pools (OpenShift)
+  ocp get mcp
+
+  # Get a specific Machine Config Pool
+  ocp get mcp worker`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -418,7 +425,10 @@ Examples:
   ocp describe node worker-0
 
   # Describe a service
-  ocp describe service my-svc`,
+  ocp describe service my-svc
+
+  # Describe a Machine Config Pool (OpenShift)
+  ocp describe mcp worker`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -1118,6 +1128,34 @@ func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, res
 			names = append(names, pdb.Name)
 		}
 
+	case "machineconfigpools", "mcp":
+		dynamicClient, err := kube.NewDynamicClient(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+		}
+
+		gvr := schema.GroupVersionResource{
+			Group:    "machineconfiguration.openshift.io",
+			Version:  "v1",
+			Resource: "machineconfigpools",
+		}
+
+		mcpList, err := dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{})
+		if meta.IsNoMatchError(err) {
+			// API not available, return empty list
+			return []string{}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		for _, mcp := range mcpList.Items {
+			name, found, _ := unstructured.NestedString(mcp.Object, "metadata", "name")
+			if found && name != "" {
+				names = append(names, name)
+			}
+		}
+
 	default:
 		return nil, fmt.Errorf("unsupported resource type: %s", resourceType)
 	}
@@ -1235,6 +1273,50 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 			return err
 		}
 		return printResourceList(nss, output, out, false, showLabels, resourceType)
+
+	case "machineconfigpools", "mcp":
+		dynamicClient, err := kube.NewDynamicClient(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create dynamic client: %w", err)
+		}
+
+		gvr := schema.GroupVersionResource{
+			Group:    "machineconfiguration.openshift.io",
+			Version:  "v1",
+			Resource: "machineconfigpools",
+		}
+
+		if resourceName != "" {
+			mcp, err := dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
+			if meta.IsNoMatchError(err) {
+				return fmt.Errorf("machine config pool API not available - ensure you're connected to an OpenShift cluster")
+			}
+			if err != nil {
+				return err
+			}
+			return printResource(mcp, output, out)
+		}
+
+		mcpList, err := dynamicClient.Resource(gvr).List(ctx, opts)
+		if meta.IsNoMatchError(err) {
+			return fmt.Errorf("machine config pool API not available - ensure you're connected to an OpenShift cluster")
+		}
+		if err != nil {
+			return err
+		}
+
+		// Convert unstructured list to runtime.Object list for printResourceList
+		items, err := meta.ExtractList(mcpList)
+		if err != nil {
+			return err
+		}
+
+		if output == "json" || output == "yaml" || output == "name" {
+			return printResourceList(mcpList, output, out, false, showLabels, resourceType)
+		}
+
+		// Use custom table format for MCP
+		return printMCPTable(items, out, showLabels, false)
 
 	default:
 		return fmt.Errorf("resource type %q not yet implemented for get command", resourceType)
@@ -2236,6 +2318,211 @@ func printNamespacesTable(items []runtime.Object, out io.Writer, showLabels bool
 	return nil
 }
 
+func printMCPTable(items []runtime.Object, out io.Writer, showLabels bool, wide bool) error {
+	type mcpData struct {
+		name                 string
+		config               string
+		updated              string
+		updating             string
+		degraded             string
+		machineCount         string
+		readyMachineCount    string
+		updatedMachineCount  string
+		degradedMachineCount string
+		age                  string
+		labels               string
+	}
+
+	var mcpList []mcpData
+	widths := map[string]int{
+		"name":                 len("NAME"),
+		"config":               len("CONFIG"),
+		"updated":              len("UPDATED"),
+		"updating":             len("UPDATING"),
+		"degraded":             len("DEGRADED"),
+		"machineCount":         len("MACHINECOUNT"),
+		"readyMachineCount":    len("READYMACHINECOUNT"),
+		"updatedMachineCount":  len("UPDATEDMACHINECOUNT"),
+		"degradedMachineCount": len("DEGRADEDMACHINECOUNT"),
+		"age":                  len("AGE"),
+	}
+
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		mcp, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+
+		name, _, _ := unstructured.NestedString(mcp.Object, "metadata", "name")
+		creationTimestamp, _, _ := unstructured.NestedString(mcp.Object, "metadata", "creationTimestamp")
+
+		// Get config from status.configuration.name
+		config, _, _ := unstructured.NestedString(mcp.Object, "status", "configuration", "name")
+		if config == "" {
+			config = "<none>"
+		}
+
+		// Get conditions
+		conditions, _, _ := unstructured.NestedSlice(mcp.Object, "status", "conditions")
+		updated := "False"
+		updating := "False"
+		degraded := "False"
+
+		for _, cond := range conditions {
+			condMap, ok := cond.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			condType, _, _ := unstructured.NestedString(condMap, "type")
+			condStatus, _, _ := unstructured.NestedString(condMap, "status")
+			if condStatus == "True" {
+				switch condType {
+				case "Updated":
+					updated = "True"
+				case "Updating":
+					updating = "True"
+				case "Degraded":
+					degraded = "True"
+				}
+			}
+		}
+
+		// Get machine counts
+		machineCount, _, _ := unstructured.NestedInt64(mcp.Object, "status", "machineCount")
+		readyMachineCount, _, _ := unstructured.NestedInt64(mcp.Object, "status", "readyMachineCount")
+		updatedMachineCount, _, _ := unstructured.NestedInt64(mcp.Object, "status", "updatedMachineCount")
+		degradedMachineCount, _, _ := unstructured.NestedInt64(mcp.Object, "status", "degradedMachineCount")
+
+		// Calculate age
+		var age string
+		if creationTimestamp != "" {
+			createdTime, err := time.Parse(time.RFC3339, creationTimestamp)
+			if err == nil {
+				age = formatAge(createdTime)
+			} else {
+				age = "<unknown>"
+			}
+		} else {
+			age = "<unknown>"
+		}
+
+		// Get labels if needed
+		labels := "<none>"
+		if showLabels {
+			labelMap, _, _ := unstructured.NestedMap(mcp.Object, "metadata", "labels")
+			if len(labelMap) > 0 {
+				labelPairs := make([]string, 0, len(labelMap))
+				for k, v := range labelMap {
+					if vStr, ok := v.(string); ok {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, vStr))
+					}
+				}
+				labels = strings.Join(labelPairs, ",")
+			}
+		}
+
+		data := mcpData{
+			name:                 name,
+			config:               config,
+			updated:              updated,
+			updating:             updating,
+			degraded:             degraded,
+			machineCount:         fmt.Sprintf("%d", machineCount),
+			readyMachineCount:    fmt.Sprintf("%d", readyMachineCount),
+			updatedMachineCount:  fmt.Sprintf("%d", updatedMachineCount),
+			degradedMachineCount: fmt.Sprintf("%d", degradedMachineCount),
+			age:                  age,
+			labels:               labels,
+		}
+
+		mcpList = append(mcpList, data)
+
+		// Update widths
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.config) > widths["config"] {
+			widths["config"] = len(data.config)
+		}
+		if len(data.updated) > widths["updated"] {
+			widths["updated"] = len(data.updated)
+		}
+		if len(data.updating) > widths["updating"] {
+			widths["updating"] = len(data.updating)
+		}
+		if len(data.degraded) > widths["degraded"] {
+			widths["degraded"] = len(data.degraded)
+		}
+		if len(data.machineCount) > widths["machineCount"] {
+			widths["machineCount"] = len(data.machineCount)
+		}
+		if len(data.readyMachineCount) > widths["readyMachineCount"] {
+			widths["readyMachineCount"] = len(data.readyMachineCount)
+		}
+		if len(data.updatedMachineCount) > widths["updatedMachineCount"] {
+			widths["updatedMachineCount"] = len(data.updatedMachineCount)
+		}
+		if len(data.degradedMachineCount) > widths["degradedMachineCount"] {
+			widths["degradedMachineCount"] = len(data.degradedMachineCount)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(mcpList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["config"]),
+		fmt.Sprintf("%%-%ds", widths["updated"]),
+		fmt.Sprintf("%%-%ds", widths["updating"]),
+		fmt.Sprintf("%%-%ds", widths["degraded"]),
+		fmt.Sprintf("%%-%ds", widths["machineCount"]),
+		fmt.Sprintf("%%-%ds", widths["readyMachineCount"]),
+		fmt.Sprintf("%%-%ds", widths["updatedMachineCount"]),
+		fmt.Sprintf("%%-%ds", widths["degradedMachineCount"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "CONFIG", "UPDATED", "UPDATING", "DEGRADED", "MACHINECOUNT", "READYMACHINECOUNT", "UPDATEDMACHINECOUNT", "DEGRADEDMACHINECOUNT", "AGE")
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each MCP
+	for _, data := range mcpList {
+		var rowParts []interface{}
+		rowParts = append(rowParts, data.name, data.config, data.updated, data.updating, data.degraded,
+			data.machineCount, data.readyMachineCount, data.updatedMachineCount, data.degradedMachineCount, data.age)
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
 func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool) error {
 	// Fallback simple table
 	if len(items) == 0 {
@@ -2690,6 +2977,16 @@ func describeResource(ctx context.Context, clientset *kubernetes.Clientset, dyna
 		obj, err = clientset.CoreV1().Nodes().Get(ctx, resourceName, metav1.GetOptions{})
 	case "namespaces", "ns":
 		obj, err = clientset.CoreV1().Namespaces().Get(ctx, resourceName, metav1.GetOptions{})
+	case "machineconfigpools", "mcp":
+		gvr := schema.GroupVersionResource{
+			Group:    "machineconfiguration.openshift.io",
+			Version:  "v1",
+			Resource: "machineconfigpools",
+		}
+		obj, err = dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
+		if meta.IsNoMatchError(err) {
+			return fmt.Errorf("machine config pool API not available - ensure you're connected to an OpenShift cluster")
+		}
 	default:
 		return fmt.Errorf("resource type %q not yet implemented for describe command", resourceType)
 	}

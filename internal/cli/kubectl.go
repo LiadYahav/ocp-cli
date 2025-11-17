@@ -1,0 +1,1849 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/spf13/cobra"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	sigsyaml "sigs.k8s.io/yaml"
+
+	"github.com/liadyahav/ocp-cli/internal/kube"
+)
+
+// Common Kubernetes resource types
+var commonResources = []string{
+	"pods", "po",
+	"services", "svc",
+	"deployments", "deploy",
+	"replicasets", "rs",
+	"statefulsets", "sts",
+	"daemonsets", "ds",
+	"jobs",
+	"cronjobs", "cj",
+	"configmaps", "cm",
+	"secrets",
+	"persistentvolumeclaims", "pvc",
+	"persistentvolumes", "pv",
+	"nodes", "no",
+	"namespaces", "ns",
+	"ingresses", "ing",
+	"networkpolicies", "netpol",
+	"serviceaccounts", "sa",
+	"rolebindings", "rb",
+	"clusterrolebindings", "crb",
+	"roles",
+	"clusterroles", "cr",
+	"poddisruptionbudgets", "pdb",
+}
+
+// Commands are exported individually to be added directly to root
+
+func newGetCommand() *cobra.Command {
+	var output string
+	var namespace string
+	var allNamespaces bool
+	var selector string
+
+	cmd := &cobra.Command{
+		Use:   "get <resource-type> [resource-name]",
+		Short: "Display one or many resources",
+		Long: `Display one or many resources.
+
+Examples:
+  # List all pods
+  ocp get pods
+
+  # Get a specific pod
+  ocp get pod my-pod
+
+  # List all resources in all namespaces
+  ocp get pods --all-namespaces
+
+  # List resources with label selector
+  ocp get pods -l app=myapp`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				// Complete resource types
+				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				// Complete resource names for the given type
+				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.MinimumNArgs(1),
+		Example: `  # List all pods
+  ocp get pods
+
+  # Get a specific deployment
+  ocp get deployment my-app
+
+  # List pods in all namespaces
+  ocp get pods -A
+
+  # List with label selector
+  ocp get pods -l app=myapp`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			resourceType := args[0]
+			resourceName := ""
+			if len(args) > 1 {
+				resourceName = args[1]
+			}
+
+			// Resolve namespace
+			ns := resolveNamespace(ctx, namespace, allNamespaces)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			return getResource(ctx, clientset, resourceType, resourceName, ns, allNamespaces, selector, output, cmd.OutOrStdout())
+		},
+	}
+
+	cmd.Flags().StringVarP(&output, "output", "o", "", "Output format (json, yaml, wide, name)")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "List resources in all namespaces")
+	cmd.Flags().StringVarP(&selector, "selector", "l", "", "Selector (label query) to filter on")
+
+	return cmd
+}
+
+func newCreateCommand() *cobra.Command {
+	var namespace string
+
+	cmd := &cobra.Command{
+		Use:   "create -f <file>",
+		Short: "Create a resource from a file",
+		Long: `Create a resource from a file or stdin.
+
+Examples:
+  # Create from a file
+  ocp create -f deployment.yaml
+
+  # Create from stdin
+  cat deployment.yaml | ocp create -f -`,
+		Args: cobra.NoArgs,
+		Example: `  # Create resources from a file
+  ocp create -f deployment.yaml
+
+  # Create from multiple files
+  ocp create -f file1.yaml -f file2.yaml`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			fileFlag, err := cmd.Flags().GetStringSlice("filename")
+			if err != nil {
+				return err
+			}
+
+			if len(fileFlag) == 0 {
+				return fmt.Errorf("must specify -f or --filename")
+			}
+
+			ns := resolveNamespace(ctx, namespace, false)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			return createResources(ctx, clientset, dynamicClient, fileFlag, ns, cmd.OutOrStdout())
+		},
+	}
+
+	cmd.Flags().StringSliceP("filename", "f", []string{}, "Filename, directory, or URL to files to use to create the resource")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+
+	return cmd
+}
+
+func newEditCommand() *cobra.Command {
+	var namespace string
+
+	cmd := &cobra.Command{
+		Use:   "edit <resource-type> <resource-name>",
+		Short: "Edit a resource",
+		Long: `Edit a resource using the default editor.
+
+The editor is determined by the EDITOR environment variable, or defaults to vi.
+
+Examples:
+  # Edit a deployment
+  ocp edit deployment my-app
+
+  # Edit a pod
+  ocp edit pod my-pod`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				return completeResourceNames(cmd, args[0], toComplete, namespace, false)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.ExactArgs(2),
+		Example: `  # Edit a deployment
+  ocp edit deployment my-app
+
+  # Edit a pod
+  ocp edit pod my-pod`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			resourceType := args[0]
+			resourceName := args[1]
+			ns := resolveNamespace(ctx, namespace, false)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			return editResource(ctx, clientset, dynamicClient, resourceType, resourceName, ns, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+
+	return cmd
+}
+
+func newDeleteCommand() *cobra.Command {
+	var namespace string
+	var allNamespaces bool
+	var selector string
+	var force bool
+	var maxConcurrency int
+
+	cmd := &cobra.Command{
+		Use:   "delete <resource-type> [resource-name]",
+		Short: "Delete resources",
+		Long: `Delete resources by resource type and name, or by selector.
+
+Examples:
+  # Delete a pod
+  ocp delete pod my-pod
+
+  # Delete all pods matching a selector
+  ocp delete pods -l app=myapp
+
+  # Delete multiple resources
+  ocp delete pod pod1 pod2 pod3`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.MinimumNArgs(1),
+		Example: `  # Delete a pod
+  ocp delete pod my-pod
+
+  # Delete all pods with a label
+  ocp delete pods -l app=myapp
+
+  # Delete multiple resources
+  ocp delete pod pod1 pod2 pod3`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			resourceType := args[0]
+			resourceNames := args[1:]
+
+			ns := resolveNamespace(ctx, namespace, allNamespaces)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			if maxConcurrency <= 0 {
+				maxConcurrency = 10
+			}
+
+			return deleteResources(ctx, clientset, dynamicClient, resourceType, resourceNames, ns, allNamespaces, selector, force, maxConcurrency, cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Delete resources in all namespaces")
+	cmd.Flags().StringVarP(&selector, "selector", "l", "", "Selector (label query) to filter on")
+	cmd.Flags().BoolVar(&force, "force", false, "Immediately remove resources from API and bypass graceful deletion")
+	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 10, "Maximum number of concurrent deletions")
+
+	return cmd
+}
+
+func newDescribeCommand() *cobra.Command {
+	var namespace string
+	var allNamespaces bool
+
+	cmd := &cobra.Command{
+		Use:   "describe <resource-type> <resource-name>",
+		Short: "Show details of a specific resource",
+		Long: `Show details of a specific resource or group of resources.
+
+Examples:
+  # Describe a pod
+  ocp describe pod my-pod
+
+  # Describe a deployment
+  ocp describe deployment my-app`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.ExactArgs(2),
+		Example: `  # Describe a pod
+  ocp describe pod my-pod
+
+  # Describe a deployment
+  ocp describe deployment my-app`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			resourceType := args[0]
+			resourceName := args[1]
+			ns := resolveNamespace(ctx, namespace, allNamespaces)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			return describeResource(ctx, clientset, dynamicClient, resourceType, resourceName, ns, allNamespaces, cmd.OutOrStdout())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Describe resources in all namespaces")
+
+	return cmd
+}
+
+func newLogsCommand() *cobra.Command {
+	var namespace string
+	var container string
+	var follow bool
+	var previous bool
+	var tailLines int
+	var since time.Duration
+
+	cmd := &cobra.Command{
+		Use:   "logs <pod-name>",
+		Short: "Print the logs for a container in a pod",
+		Long: `Print the logs for a container in a pod.
+
+Examples:
+  # Get logs from a pod
+  ocp logs my-pod
+
+  # Follow logs
+  ocp logs -f my-pod
+
+  # Get logs from a specific container
+  ocp logs my-pod -c my-container`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completePodNames(cmd, toComplete, namespace)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.ExactArgs(1),
+		Example: `  # Get logs from a pod
+  ocp logs my-pod
+
+  # Follow logs
+  ocp logs -f my-pod
+
+  # Get last 100 lines
+  ocp logs my-pod --tail=100`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			podName := args[0]
+			ns := resolveNamespace(ctx, namespace, false)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			return getPodLogs(ctx, clientset, podName, ns, container, follow, previous, tailLines, since, cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().StringVarP(&container, "container", "c", "", "Print logs from this container")
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow log output")
+	cmd.Flags().BoolVar(&previous, "previous", false, "If true, print the logs for the previous instance of the container")
+	cmd.Flags().IntVar(&tailLines, "tail", -1, "Lines of recent log file to display")
+	cmd.Flags().DurationVar(&since, "since", 0, "Only return logs newer than a relative duration like 5s, 2m, or 3h")
+
+	return cmd
+}
+
+func newApplyCommand() *cobra.Command {
+	var namespace string
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:   "apply -f <file>",
+		Short: "Apply a configuration to a resource",
+		Long: `Apply a configuration to a resource by filename or stdin.
+
+Examples:
+  # Apply from a file
+  ocp apply -f deployment.yaml
+
+  # Apply from stdin
+  cat deployment.yaml | ocp apply -f -`,
+		Args: cobra.NoArgs,
+		Example: `  # Apply resources from a file
+  ocp apply -f deployment.yaml
+
+  # Apply from multiple files
+  ocp apply -f file1.yaml -f file2.yaml`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			fileFlag, err := cmd.Flags().GetStringSlice("filename")
+			if err != nil {
+				return err
+			}
+
+			if len(fileFlag) == 0 {
+				return fmt.Errorf("must specify -f or --filename")
+			}
+
+			ns := resolveNamespace(ctx, namespace, false)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			return applyResources(ctx, clientset, dynamicClient, fileFlag, ns, force, cmd.OutOrStdout())
+		},
+	}
+
+	cmd.Flags().StringSliceP("filename", "f", []string{}, "Filename, directory, or URL to files to use to apply the resource")
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().BoolVar(&force, "force", false, "Force apply, recreate resources if necessary")
+
+	return cmd
+}
+
+func newPatchCommand() *cobra.Command {
+	var namespace string
+	var patchType string
+	var patch string
+	var patchFile string
+
+	cmd := &cobra.Command{
+		Use:   "patch <resource-type> <resource-name>",
+		Short: "Update field(s) of a resource",
+		Long: `Update field(s) of a resource using strategic merge patch, JSON merge patch, or JSON patch.
+
+Examples:
+  # Patch using JSON
+  ocp patch pod my-pod -p '{"spec":{"containers":[{"name":"my-container","image":"new-image"}]}}'
+
+  # Patch from a file
+  ocp patch pod my-pod --patch-file patch.yaml`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				return completeResourceNames(cmd, args[0], toComplete, namespace, false)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.ExactArgs(2),
+		Example: `  # Patch a pod
+  ocp patch pod my-pod -p '{"spec":{"containers":[{"name":"my-container","image":"new-image"}]}}'
+
+  # Patch from file
+  ocp patch pod my-pod --patch-file patch.yaml`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			resourceType := args[0]
+			resourceName := args[1]
+			ns := resolveNamespace(ctx, namespace, false)
+
+			if patch == "" && patchFile == "" {
+				return fmt.Errorf("must specify either -p/--patch or --patch-file")
+			}
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			return patchResource(ctx, clientset, dynamicClient, resourceType, resourceName, ns, patchType, patch, patchFile, cmd.OutOrStdout())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().StringVarP(&patch, "patch", "p", "", "The patch to be applied to the resource JSON file")
+	cmd.Flags().StringVar(&patchFile, "patch-file", "", "The file containing the patch to be applied")
+	cmd.Flags().StringVar(&patchType, "type", "strategic", "The type of patch being provided (strategic, merge, json)")
+
+	return cmd
+}
+
+// Helper functions
+
+func resolveNamespace(ctx context.Context, explicitNS string, allNamespaces bool) string {
+	if allNamespaces {
+		return ""
+	}
+	if explicitNS != "" {
+		return explicitNS
+	}
+	return getCurrentNamespace(ctx)
+}
+
+func filterCompletions(items []string, prefix string) []string {
+	completions := make([]string, 0)
+	for _, item := range items {
+		if strings.HasPrefix(item, prefix) {
+			completions = append(completions, item)
+		}
+	}
+	return completions
+}
+
+func completeResourceNames(cmd *cobra.Command, resourceType string, toComplete string, namespace string, allNamespaces bool) ([]string, cobra.ShellCompDirective) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	ns := resolveNamespace(ctx, namespace, allNamespaces)
+
+	// Normalize resource type (handle aliases)
+	resourceType = normalizeResourceType(resourceType)
+
+	names, err := listResourceNames(ctx, clientset, resourceType, ns, allNamespaces)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	return filterCompletions(names, toComplete), cobra.ShellCompDirectiveNoFileComp
+}
+
+func completePodNames(cmd *cobra.Command, toComplete string, namespace string) ([]string, cobra.ShellCompDirective) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	ns := resolveNamespace(ctx, namespace, false)
+
+	pods, err := clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	names := make([]string, 0, len(pods.Items))
+	for _, pod := range pods.Items {
+		if strings.HasPrefix(pod.Name, toComplete) {
+			names = append(names, pod.Name)
+		}
+	}
+
+	return names, cobra.ShellCompDirectiveNoFileComp
+}
+
+func normalizeResourceType(resourceType string) string {
+	// Handle common aliases
+	aliasMap := map[string]string{
+		"po":  "pods",
+		"svc": "services",
+		"deploy": "deployments",
+		"rs":   "replicasets",
+		"sts":  "statefulsets",
+		"ds":   "daemonsets",
+		"cj":   "cronjobs",
+		"cm":   "configmaps",
+		"pvc":  "persistentvolumeclaims",
+		"pv":   "persistentvolumes",
+		"no":   "nodes",
+		"ns":   "namespaces",
+		"ing":  "ingresses",
+		"netpol": "networkpolicies",
+		"sa":   "serviceaccounts",
+		"rb":   "rolebindings",
+		"crb":  "clusterrolebindings",
+		"cr":   "clusterroles",
+		"pdb":  "poddisruptionbudgets",
+	}
+
+	if normalized, ok := aliasMap[resourceType]; ok {
+		return normalized
+	}
+	return resourceType
+}
+
+func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, namespace string, allNamespaces bool) ([]string, error) {
+	names := make([]string, 0)
+
+	switch resourceType {
+	case "pods", "po":
+		var pods *corev1.PodList
+		var err error
+		if allNamespaces {
+			pods, err = clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+		} else {
+			pods, err = clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, pod := range pods.Items {
+			names = append(names, pod.Name)
+		}
+
+	case "services", "svc":
+		var svcs *corev1.ServiceList
+		var err error
+		if allNamespaces {
+			svcs, err = clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+		} else {
+			svcs, err = clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, svc := range svcs.Items {
+			names = append(names, svc.Name)
+		}
+
+	case "deployments", "deploy":
+		var deploys *appsv1.DeploymentList
+		var err error
+		if allNamespaces {
+			deploys, err = clientset.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
+		} else {
+			deploys, err = clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, deploy := range deploys.Items {
+			names = append(names, deploy.Name)
+		}
+
+	case "replicasets", "rs":
+		var rs *appsv1.ReplicaSetList
+		var err error
+		if allNamespaces {
+			rs, err = clientset.AppsV1().ReplicaSets("").List(ctx, metav1.ListOptions{})
+		} else {
+			rs, err = clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rs.Items {
+			names = append(names, r.Name)
+		}
+
+	case "statefulsets", "sts":
+		var sts *appsv1.StatefulSetList
+		var err error
+		if allNamespaces {
+			sts, err = clientset.AppsV1().StatefulSets("").List(ctx, metav1.ListOptions{})
+		} else {
+			sts, err = clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range sts.Items {
+			names = append(names, s.Name)
+		}
+
+	case "daemonsets", "ds":
+		var ds *appsv1.DaemonSetList
+		var err error
+		if allNamespaces {
+			ds, err = clientset.AppsV1().DaemonSets("").List(ctx, metav1.ListOptions{})
+		} else {
+			ds, err = clientset.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range ds.Items {
+			names = append(names, d.Name)
+		}
+
+	case "jobs":
+		var jobs *batchv1.JobList
+		var err error
+		if allNamespaces {
+			jobs, err = clientset.BatchV1().Jobs("").List(ctx, metav1.ListOptions{})
+		} else {
+			jobs, err = clientset.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, job := range jobs.Items {
+			names = append(names, job.Name)
+		}
+
+	case "cronjobs", "cj":
+		var cjs *batchv1.CronJobList
+		var err error
+		if allNamespaces {
+			cjs, err = clientset.BatchV1().CronJobs("").List(ctx, metav1.ListOptions{})
+		} else {
+			cjs, err = clientset.BatchV1().CronJobs(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, cj := range cjs.Items {
+			names = append(names, cj.Name)
+		}
+
+	case "configmaps", "cm":
+		var cms *corev1.ConfigMapList
+		var err error
+		if allNamespaces {
+			cms, err = clientset.CoreV1().ConfigMaps("").List(ctx, metav1.ListOptions{})
+		} else {
+			cms, err = clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, cm := range cms.Items {
+			names = append(names, cm.Name)
+		}
+
+	case "secrets":
+		var secrets *corev1.SecretList
+		var err error
+		if allNamespaces {
+			secrets, err = clientset.CoreV1().Secrets("").List(ctx, metav1.ListOptions{})
+		} else {
+			secrets, err = clientset.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, secret := range secrets.Items {
+			names = append(names, secret.Name)
+		}
+
+	case "persistentvolumeclaims", "pvc":
+		var pvcs *corev1.PersistentVolumeClaimList
+		var err error
+		if allNamespaces {
+			pvcs, err = clientset.CoreV1().PersistentVolumeClaims("").List(ctx, metav1.ListOptions{})
+		} else {
+			pvcs, err = clientset.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, pvc := range pvcs.Items {
+			names = append(names, pvc.Name)
+		}
+
+	case "persistentvolumes", "pv":
+		pvs, err := clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		for _, pv := range pvs.Items {
+			names = append(names, pv.Name)
+		}
+
+	case "nodes", "no":
+		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		for _, node := range nodes.Items {
+			names = append(names, node.Name)
+		}
+
+	case "namespaces", "ns":
+		nss, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		for _, ns := range nss.Items {
+			names = append(names, ns.Name)
+		}
+
+	case "ingresses", "ing":
+		var ings *networkingv1.IngressList
+		var err error
+		if allNamespaces {
+			ings, err = clientset.NetworkingV1().Ingresses("").List(ctx, metav1.ListOptions{})
+		} else {
+			ings, err = clientset.NetworkingV1().Ingresses(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, ing := range ings.Items {
+			names = append(names, ing.Name)
+		}
+
+	case "networkpolicies", "netpol":
+		var netpols *networkingv1.NetworkPolicyList
+		var err error
+		if allNamespaces {
+			netpols, err = clientset.NetworkingV1().NetworkPolicies("").List(ctx, metav1.ListOptions{})
+		} else {
+			netpols, err = clientset.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, np := range netpols.Items {
+			names = append(names, np.Name)
+		}
+
+	case "serviceaccounts", "sa":
+		var sas *corev1.ServiceAccountList
+		var err error
+		if allNamespaces {
+			sas, err = clientset.CoreV1().ServiceAccounts("").List(ctx, metav1.ListOptions{})
+		} else {
+			sas, err = clientset.CoreV1().ServiceAccounts(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, sa := range sas.Items {
+			names = append(names, sa.Name)
+		}
+
+	case "rolebindings", "rb":
+		var rbs *rbacv1.RoleBindingList
+		var err error
+		if allNamespaces {
+			// RoleBindings are namespace-scoped, need to list all namespaces
+			nss, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, err
+			}
+			for _, ns := range nss.Items {
+				rbs, err := clientset.RbacV1().RoleBindings(ns.Name).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					continue
+				}
+				for _, rb := range rbs.Items {
+					names = append(names, rb.Name)
+				}
+			}
+		} else {
+			rbs, err = clientset.RbacV1().RoleBindings(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, err
+			}
+			for _, rb := range rbs.Items {
+				names = append(names, rb.Name)
+			}
+		}
+
+	case "clusterrolebindings", "crb":
+		crbs, err := clientset.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		for _, crb := range crbs.Items {
+			names = append(names, crb.Name)
+		}
+
+	case "roles":
+		var roles *rbacv1.RoleList
+		var err error
+		if allNamespaces {
+			nss, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, err
+			}
+			for _, ns := range nss.Items {
+				roles, err := clientset.RbacV1().Roles(ns.Name).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					continue
+				}
+				for _, role := range roles.Items {
+					names = append(names, role.Name)
+				}
+			}
+		} else {
+			roles, err = clientset.RbacV1().Roles(namespace).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, err
+			}
+			for _, role := range roles.Items {
+				names = append(names, role.Name)
+			}
+		}
+
+	case "clusterroles", "cr":
+		crs, err := clientset.RbacV1().ClusterRoles().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		for _, cr := range crs.Items {
+			names = append(names, cr.Name)
+		}
+
+	case "poddisruptionbudgets", "pdb":
+		var pdbs *policyv1.PodDisruptionBudgetList
+		var err error
+		if allNamespaces {
+			pdbs, err = clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
+		} else {
+			pdbs, err = clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, pdb := range pdbs.Items {
+			names = append(names, pdb.Name)
+		}
+
+	default:
+		return nil, fmt.Errorf("unsupported resource type: %s", resourceType)
+	}
+
+	return names, nil
+}
+
+// Implementation functions
+
+func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, resourceName string, namespace string, allNamespaces bool, selector string, output string, out io.Writer) error {
+	resourceType = normalizeResourceType(resourceType)
+	opts := metav1.ListOptions{}
+	if selector != "" {
+		opts.LabelSelector = selector
+	}
+
+	var err error
+	switch resourceType {
+	case "pods", "po":
+		var pods *corev1.PodList
+		if resourceName != "" {
+			var pod *corev1.Pod
+			if allNamespaces {
+				pod, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			} else {
+				pod, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			}
+			if err != nil {
+				return err
+			}
+			return printResource(pod, output, out)
+		}
+		if allNamespaces {
+			pods, err = clientset.CoreV1().Pods("").List(ctx, opts)
+		} else {
+			pods, err = clientset.CoreV1().Pods(namespace).List(ctx, opts)
+		}
+		if err != nil {
+			return err
+		}
+		return printResourceList(pods, output, out, allNamespaces)
+
+	case "services", "svc":
+		var svcs *corev1.ServiceList
+		if resourceName != "" {
+			var svc *corev1.Service
+			if allNamespaces {
+				svc, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			} else {
+				svc, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			}
+			if err != nil {
+				return err
+			}
+			return printResource(svc, output, out)
+		}
+		if allNamespaces {
+			svcs, err = clientset.CoreV1().Services("").List(ctx, opts)
+		} else {
+			svcs, err = clientset.CoreV1().Services(namespace).List(ctx, opts)
+		}
+		if err != nil {
+			return err
+		}
+		return printResourceList(svcs, output, out, allNamespaces)
+
+	case "deployments", "deploy":
+		var deploys *appsv1.DeploymentList
+		if resourceName != "" {
+			var deploy *appsv1.Deployment
+			if allNamespaces {
+				deploy, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			} else {
+				deploy, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			}
+			if err != nil {
+				return err
+			}
+			return printResource(deploy, output, out)
+		}
+		if allNamespaces {
+			deploys, err = clientset.AppsV1().Deployments("").List(ctx, opts)
+		} else {
+			deploys, err = clientset.AppsV1().Deployments(namespace).List(ctx, opts)
+		}
+		if err != nil {
+			return err
+		}
+		return printResourceList(deploys, output, out, allNamespaces)
+
+	case "nodes", "no":
+		if resourceName != "" {
+			node, err := clientset.CoreV1().Nodes().Get(ctx, resourceName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			return printResource(node, output, out)
+		}
+		nodes, err := clientset.CoreV1().Nodes().List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		return printResourceList(nodes, output, out, false)
+
+	case "namespaces", "ns":
+		if resourceName != "" {
+			ns, err := clientset.CoreV1().Namespaces().Get(ctx, resourceName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			return printResource(ns, output, out)
+		}
+		nss, err := clientset.CoreV1().Namespaces().List(ctx, opts)
+		if err != nil {
+			return err
+		}
+		return printResourceList(nss, output, out, false)
+
+	default:
+		return fmt.Errorf("resource type %q not yet implemented for get command", resourceType)
+	}
+}
+
+func printResource(obj runtime.Object, output string, out io.Writer) error {
+	switch output {
+	case "json":
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(obj)
+	case "yaml":
+		data, err := sigsyaml.Marshal(obj)
+		if err != nil {
+			return err
+		}
+		_, err = out.Write(data)
+		return err
+	case "name":
+		meta, err := meta.Accessor(obj)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "%s\n", meta.GetName())
+		return nil
+	default:
+		// Default table format
+		data, err := sigsyaml.Marshal(obj)
+		if err != nil {
+			return err
+		}
+		_, err = out.Write(data)
+		return err
+	}
+}
+
+func printResourceList(list runtime.Object, output string, out io.Writer, allNamespaces bool) error {
+	switch output {
+	case "json":
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(list)
+	case "yaml":
+		data, err := sigsyaml.Marshal(list)
+		if err != nil {
+			return err
+		}
+		_, err = out.Write(data)
+		return err
+	case "name":
+		// Extract items and print names
+		items, err := meta.ExtractList(list)
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			meta, err := meta.Accessor(item)
+			if err != nil {
+				continue
+			}
+			if allNamespaces {
+				fmt.Fprintf(out, "%s/%s\n", meta.GetNamespace(), meta.GetName())
+			} else {
+				fmt.Fprintf(out, "%s\n", meta.GetName())
+			}
+		}
+		return nil
+	default:
+		// Simple table format
+		items, err := meta.ExtractList(list)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			fmt.Fprintf(out, "No resources found.\n")
+			return nil
+		}
+		if allNamespaces {
+			fmt.Fprintf(out, "%-20s %-50s %-10s %-10s\n", "NAMESPACE", "NAME", "READY", "STATUS")
+			fmt.Fprintf(out, "%-20s %-50s %-10s %-10s\n", strings.Repeat("-", 20), strings.Repeat("-", 50), strings.Repeat("-", 10), strings.Repeat("-", 10))
+		} else {
+			fmt.Fprintf(out, "%-50s %-10s %-10s\n", "NAME", "READY", "STATUS")
+			fmt.Fprintf(out, "%-50s %-10s %-10s\n", strings.Repeat("-", 50), strings.Repeat("-", 10), strings.Repeat("-", 10))
+		}
+		for _, item := range items {
+			meta, err := meta.Accessor(item)
+			if err != nil {
+				continue
+			}
+			// Try to extract status information based on type
+			status := "Unknown"
+			ready := "-"
+			switch obj := item.(type) {
+			case *corev1.Pod:
+				status = string(obj.Status.Phase)
+				ready = fmt.Sprintf("%d/%d", getReadyContainers(obj), len(obj.Spec.Containers))
+			case *appsv1.Deployment:
+				status = fmt.Sprintf("%d/%d", obj.Status.ReadyReplicas, obj.Status.Replicas)
+				ready = status
+			}
+			if allNamespaces {
+				fmt.Fprintf(out, "%-20s %-50s %-10s %-10s\n", meta.GetNamespace(), meta.GetName(), ready, status)
+			} else {
+				fmt.Fprintf(out, "%-50s %-10s %-10s\n", meta.GetName(), ready, status)
+			}
+		}
+		return nil
+	}
+}
+
+func getReadyContainers(pod *corev1.Pod) int {
+	ready := 0
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Ready {
+			ready++
+		}
+	}
+	return ready
+}
+
+func createResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, files []string, namespace string, out io.Writer) error {
+	var createdCount int
+	var failedCount int
+	var failedResources []string
+
+	for _, file := range files {
+		func() {
+			var reader io.Reader
+			var f *os.File
+			if file == "-" {
+				reader = os.Stdin
+			} else {
+				var err error
+				f, err = os.Open(file)
+				if err != nil {
+					fmt.Fprintf(out, "✗ Error opening file %s: %v\n", file, err)
+					failedCount++
+					failedResources = append(failedResources, file)
+					return
+				}
+				defer f.Close()
+				reader = f
+			}
+
+			decoder := yaml.NewYAMLOrJSONDecoder(reader, 4096)
+			for {
+				var obj unstructured.Unstructured
+				if err := decoder.Decode(&obj); err != nil {
+					if err == io.EOF {
+						break
+					}
+					fmt.Fprintf(out, "✗ Error decoding resource from %s: %v\n", file, err)
+					failedCount++
+					failedResources = append(failedResources, file)
+					continue
+				}
+
+				if obj.Object == nil {
+					continue
+				}
+
+				// Override namespace if specified
+				if namespace != "" {
+					obj.SetNamespace(namespace)
+				}
+
+				// Use dynamic client to create
+				gvr := schema.GroupVersionResource{
+					Group:    obj.GroupVersionKind().Group,
+					Version:  obj.GroupVersionKind().Version,
+					Resource: strings.ToLower(obj.GetKind()) + "s",
+				}
+
+				ns := obj.GetNamespace()
+				if ns == "" {
+					ns = "default"
+				}
+
+				resourceClient := dynamicClient.Resource(gvr).Namespace(ns)
+				_, err := resourceClient.Create(ctx, &obj, metav1.CreateOptions{})
+				if err != nil {
+					fmt.Fprintf(out, "✗ Error creating %s/%s: %v\n", obj.GetKind(), obj.GetName(), err)
+					failedCount++
+					failedResources = append(failedResources, fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName()))
+					continue
+				}
+
+				fmt.Fprintf(out, "✓ Created %s/%s\n", obj.GetKind(), obj.GetName())
+				createdCount++
+			}
+		}()
+	}
+
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Created: %d\n", createdCount)
+	fmt.Fprintf(out, "Failed: %d\n", failedCount)
+
+	if failedCount > 0 {
+		if len(failedResources) > 0 {
+			fmt.Fprintf(out, "\n✗ Failed resources:\n")
+			for _, res := range failedResources {
+				fmt.Fprintf(out, "  - %s\n", res)
+			}
+		}
+		return fmt.Errorf("failed to create %d resource(s)", failedCount)
+	}
+
+	return nil
+}
+
+func editResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
+	resourceType = normalizeResourceType(resourceType)
+
+	// Get the resource
+	var obj runtime.Object
+	var err error
+
+	switch resourceType {
+	case "pods", "po":
+		obj, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	case "services", "svc":
+		obj, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	case "deployments", "deploy":
+		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	default:
+		return fmt.Errorf("resource type %q not yet implemented for edit command", resourceType)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to get resource: %w", err)
+	}
+
+	// Convert to YAML
+	yamlData, err := sigsyaml.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal resource: %w", err)
+	}
+
+	// Write to temp file
+	tmpFile, err := os.CreateTemp("", "ocp-edit-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(yamlData); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	// Determine editor
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+
+	// Open editor
+	editCmd := exec.Command(editor, tmpFile.Name())
+	editCmd.Stdin = stdin
+	editCmd.Stdout = stdout
+	editCmd.Stderr = stderr
+	if err := editCmd.Run(); err != nil {
+		return fmt.Errorf("editor exited with error: %w", err)
+	}
+
+	// Read edited file
+	editedData, err := os.ReadFile(tmpFile.Name())
+	if err != nil {
+		return fmt.Errorf("failed to read edited file: %w", err)
+	}
+
+	// Parse and apply
+	var editedObj unstructured.Unstructured
+	if err := sigsyaml.Unmarshal(editedData, &editedObj); err != nil {
+		return fmt.Errorf("failed to parse edited YAML: %w", err)
+	}
+
+	// Update the resource
+	switch resourceType {
+	case "pods", "po":
+		var pod corev1.Pod
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(editedObj.Object, &pod); err != nil {
+			return fmt.Errorf("failed to convert to Pod: %w", err)
+		}
+		_, err = clientset.CoreV1().Pods(namespace).Update(ctx, &pod, metav1.UpdateOptions{})
+	case "services", "svc":
+		var svc corev1.Service
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(editedObj.Object, &svc); err != nil {
+			return fmt.Errorf("failed to convert to Service: %w", err)
+		}
+		_, err = clientset.CoreV1().Services(namespace).Update(ctx, &svc, metav1.UpdateOptions{})
+	case "deployments", "deploy":
+		var deploy appsv1.Deployment
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(editedObj.Object, &deploy); err != nil {
+			return fmt.Errorf("failed to convert to Deployment: %w", err)
+		}
+		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, &deploy, metav1.UpdateOptions{})
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to update resource: %w", err)
+	}
+
+	fmt.Fprintf(stdout, "✓ %s/%s edited\n", resourceType, resourceName)
+	return nil
+}
+
+func deleteResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceNames []string, namespace string, allNamespaces bool, selector string, force bool, maxConcurrency int, out io.Writer, errOut io.Writer) error {
+	resourceType = normalizeResourceType(resourceType)
+
+	var resourcesToDelete []resourceIdentifier
+
+	// If selector is provided, list resources by selector
+	if selector != "" {
+		opts := metav1.ListOptions{LabelSelector: selector}
+		var err error
+		switch resourceType {
+		case "pods", "po":
+			var pods *corev1.PodList
+			if allNamespaces {
+				pods, err = clientset.CoreV1().Pods("").List(ctx, opts)
+			} else {
+				pods, err = clientset.CoreV1().Pods(namespace).List(ctx, opts)
+			}
+			if err != nil {
+				return err
+			}
+			for _, pod := range pods.Items {
+				resourcesToDelete = append(resourcesToDelete, resourceIdentifier{
+					name:      pod.Name,
+					namespace: pod.Namespace,
+				})
+			}
+		case "deployments", "deploy":
+			var deploys *appsv1.DeploymentList
+			if allNamespaces {
+				deploys, err = clientset.AppsV1().Deployments("").List(ctx, opts)
+			} else {
+				deploys, err = clientset.AppsV1().Deployments(namespace).List(ctx, opts)
+			}
+			if err != nil {
+				return err
+			}
+			for _, deploy := range deploys.Items {
+				resourcesToDelete = append(resourcesToDelete, resourceIdentifier{
+					name:      deploy.Name,
+					namespace: deploy.Namespace,
+				})
+			}
+		default:
+			return fmt.Errorf("selector not yet supported for resource type %q", resourceType)
+		}
+	} else if len(resourceNames) > 0 {
+		// Delete specific resources
+		for _, name := range resourceNames {
+			resourcesToDelete = append(resourcesToDelete, resourceIdentifier{
+				name:      name,
+				namespace: namespace,
+			})
+		}
+	} else {
+		return fmt.Errorf("must specify resource names or use --selector")
+	}
+
+	if len(resourcesToDelete) == 0 {
+		fmt.Fprintf(out, "No resources found to delete.\n")
+		return nil
+	}
+
+	// Use worker pool for concurrent deletion
+	type deleteResult struct {
+		resource resourceIdentifier
+		err      error
+	}
+
+	resourceChan := make(chan resourceIdentifier, len(resourcesToDelete))
+	resultChan := make(chan deleteResult, len(resourcesToDelete))
+
+	for _, res := range resourcesToDelete {
+		resourceChan <- res
+	}
+	close(resourceChan)
+
+	var wg sync.WaitGroup
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for res := range resourceChan {
+				err := deleteSingleResource(ctx, clientset, resourceType, res.name, res.namespace, force)
+				resultChan <- deleteResult{resource: res, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	var deletedCount int
+	var failedCount int
+	var failedResources []string
+
+	for result := range resultChan {
+		if result.err != nil {
+			fmt.Fprintf(errOut, "✗ Failed to delete %s/%s: %v\n", result.resource.namespace, result.resource.name, result.err)
+			failedCount++
+			failedResources = append(failedResources, fmt.Sprintf("%s/%s", result.resource.namespace, result.resource.name))
+		} else {
+			fmt.Fprintf(out, "✓ Deleted %s/%s\n", result.resource.namespace, result.resource.name)
+			deletedCount++
+		}
+	}
+
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Deleted: %d\n", deletedCount)
+	fmt.Fprintf(out, "Failed: %d\n", failedCount)
+
+	if failedCount > 0 {
+		fmt.Fprintf(errOut, "\n✗ Failed to delete:\n")
+		for _, res := range failedResources {
+			fmt.Fprintf(errOut, "  - %s\n", res)
+		}
+		return fmt.Errorf("failed to delete %d resource(s)", failedCount)
+	}
+
+	return nil
+}
+
+type resourceIdentifier struct {
+	name      string
+	namespace string
+}
+
+func deleteSingleResource(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, resourceName string, namespace string, force bool) error {
+	opts := metav1.DeleteOptions{}
+	if force {
+		gracePeriod := int64(0)
+		opts.GracePeriodSeconds = &gracePeriod
+	}
+
+	switch resourceType {
+	case "pods", "po":
+		return clientset.CoreV1().Pods(namespace).Delete(ctx, resourceName, opts)
+	case "services", "svc":
+		return clientset.CoreV1().Services(namespace).Delete(ctx, resourceName, opts)
+	case "deployments", "deploy":
+		return clientset.AppsV1().Deployments(namespace).Delete(ctx, resourceName, opts)
+	case "replicasets", "rs":
+		return clientset.AppsV1().ReplicaSets(namespace).Delete(ctx, resourceName, opts)
+	case "statefulsets", "sts":
+		return clientset.AppsV1().StatefulSets(namespace).Delete(ctx, resourceName, opts)
+	case "daemonsets", "ds":
+		return clientset.AppsV1().DaemonSets(namespace).Delete(ctx, resourceName, opts)
+	case "jobs":
+		return clientset.BatchV1().Jobs(namespace).Delete(ctx, resourceName, opts)
+	case "cronjobs", "cj":
+		return clientset.BatchV1().CronJobs(namespace).Delete(ctx, resourceName, opts)
+	case "configmaps", "cm":
+		return clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, resourceName, opts)
+	case "secrets":
+		return clientset.CoreV1().Secrets(namespace).Delete(ctx, resourceName, opts)
+	case "persistentvolumeclaims", "pvc":
+		return clientset.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, resourceName, opts)
+	case "persistentvolumes", "pv":
+		return clientset.CoreV1().PersistentVolumes().Delete(ctx, resourceName, opts)
+	case "nodes", "no":
+		return clientset.CoreV1().Nodes().Delete(ctx, resourceName, opts)
+	case "namespaces", "ns":
+		return clientset.CoreV1().Namespaces().Delete(ctx, resourceName, opts)
+	case "ingresses", "ing":
+		return clientset.NetworkingV1().Ingresses(namespace).Delete(ctx, resourceName, opts)
+	case "networkpolicies", "netpol":
+		return clientset.NetworkingV1().NetworkPolicies(namespace).Delete(ctx, resourceName, opts)
+	case "serviceaccounts", "sa":
+		return clientset.CoreV1().ServiceAccounts(namespace).Delete(ctx, resourceName, opts)
+	case "rolebindings", "rb":
+		return clientset.RbacV1().RoleBindings(namespace).Delete(ctx, resourceName, opts)
+	case "clusterrolebindings", "crb":
+		return clientset.RbacV1().ClusterRoleBindings().Delete(ctx, resourceName, opts)
+	case "roles":
+		return clientset.RbacV1().Roles(namespace).Delete(ctx, resourceName, opts)
+	case "clusterroles", "cr":
+		return clientset.RbacV1().ClusterRoles().Delete(ctx, resourceName, opts)
+	case "poddisruptionbudgets", "pdb":
+		return clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, resourceName, opts)
+	default:
+		return fmt.Errorf("resource type %q not yet implemented for delete command", resourceType)
+	}
+}
+
+func describeResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, allNamespaces bool, out io.Writer) error {
+	resourceType = normalizeResourceType(resourceType)
+
+	var obj runtime.Object
+	var err error
+
+	switch resourceType {
+	case "pods", "po":
+		obj, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	case "services", "svc":
+		obj, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	case "deployments", "deploy":
+		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	case "nodes", "no":
+		obj, err = clientset.CoreV1().Nodes().Get(ctx, resourceName, metav1.GetOptions{})
+	case "namespaces", "ns":
+		obj, err = clientset.CoreV1().Namespaces().Get(ctx, resourceName, metav1.GetOptions{})
+	default:
+		return fmt.Errorf("resource type %q not yet implemented for describe command", resourceType)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to get resource: %w", err)
+	}
+
+	// Print detailed information
+	data, err := sigsyaml.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal resource: %w", err)
+	}
+
+	_, err = out.Write(data)
+	return err
+}
+
+func getPodLogs(ctx context.Context, clientset *kubernetes.Clientset, podName string, namespace string, container string, follow bool, previous bool, tailLines int, since time.Duration, out io.Writer, errOut io.Writer) error {
+	opts := &corev1.PodLogOptions{
+		Follow:    follow,
+		Previous:  previous,
+		Container: container,
+	}
+
+	if tailLines > 0 {
+		tail := int64(tailLines)
+		opts.TailLines = &tail
+	}
+
+	if since > 0 {
+		sinceTime := metav1.NewTime(time.Now().Add(-since))
+		opts.SinceTime = &sinceTime
+	}
+
+	req := clientset.CoreV1().Pods(namespace).GetLogs(podName, opts)
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get logs: %w", err)
+	}
+	defer stream.Close()
+
+	_, err = io.Copy(out, stream)
+	return err
+}
+
+func applyResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, files []string, namespace string, force bool, out io.Writer) error {
+	var appliedCount int
+	var failedCount int
+	var failedResources []string
+
+	for _, file := range files {
+		func() {
+			var reader io.Reader
+			var f *os.File
+			if file == "-" {
+				reader = os.Stdin
+			} else {
+				var err error
+				f, err = os.Open(file)
+				if err != nil {
+					fmt.Fprintf(out, "✗ Error opening file %s: %v\n", file, err)
+					failedCount++
+					failedResources = append(failedResources, file)
+					return
+				}
+				defer f.Close()
+				reader = f
+			}
+
+			decoder := yaml.NewYAMLOrJSONDecoder(reader, 4096)
+			for {
+				var obj unstructured.Unstructured
+				if err := decoder.Decode(&obj); err != nil {
+					if err == io.EOF {
+						break
+					}
+					fmt.Fprintf(out, "✗ Error decoding resource from %s: %v\n", file, err)
+					failedCount++
+					failedResources = append(failedResources, file)
+					continue
+				}
+
+				if obj.Object == nil {
+					continue
+				}
+
+				// Override namespace if specified
+				if namespace != "" {
+					obj.SetNamespace(namespace)
+				}
+
+				// Try to get existing resource
+				gvr := schema.GroupVersionResource{
+					Group:    obj.GroupVersionKind().Group,
+					Version:  obj.GroupVersionKind().Version,
+					Resource: strings.ToLower(obj.GetKind()) + "s",
+				}
+
+				ns := obj.GetNamespace()
+				if ns == "" {
+					ns = "default"
+				}
+
+				resourceClient := dynamicClient.Resource(gvr).Namespace(ns)
+				_, err := resourceClient.Get(ctx, obj.GetName(), metav1.GetOptions{})
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						// Create
+						_, err = resourceClient.Create(ctx, &obj, metav1.CreateOptions{})
+						if err != nil {
+							fmt.Fprintf(out, "✗ Error creating %s/%s: %v\n", obj.GetKind(), obj.GetName(), err)
+							failedCount++
+							failedResources = append(failedResources, fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName()))
+							continue
+						}
+						fmt.Fprintf(out, "✓ Created %s/%s\n", obj.GetKind(), obj.GetName())
+					} else {
+						fmt.Fprintf(out, "✗ Error getting %s/%s: %v\n", obj.GetKind(), obj.GetName(), err)
+						failedCount++
+						failedResources = append(failedResources, fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName()))
+						continue
+					}
+				} else {
+					// Update
+					_, err = resourceClient.Update(ctx, &obj, metav1.UpdateOptions{})
+					if err != nil {
+						fmt.Fprintf(out, "✗ Error updating %s/%s: %v\n", obj.GetKind(), obj.GetName(), err)
+						failedCount++
+						failedResources = append(failedResources, fmt.Sprintf("%s/%s", obj.GetKind(), obj.GetName()))
+						continue
+					}
+					fmt.Fprintf(out, "✓ Updated %s/%s\n", obj.GetKind(), obj.GetName())
+				}
+				appliedCount++
+			}
+		}()
+	}
+
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Applied: %d\n", appliedCount)
+	fmt.Fprintf(out, "Failed: %d\n", failedCount)
+
+	if failedCount > 0 {
+		if len(failedResources) > 0 {
+			fmt.Fprintf(out, "\n✗ Failed resources:\n")
+			for _, res := range failedResources {
+				fmt.Fprintf(out, "  - %s\n", res)
+			}
+		}
+		return fmt.Errorf("failed to apply %d resource(s)", failedCount)
+	}
+
+	return nil
+}
+
+func patchResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, patchType string, patch string, patchFile string, out io.Writer) error {
+	resourceType = normalizeResourceType(resourceType)
+
+	var patchData []byte
+	var err error
+
+	if patchFile != "" {
+		patchData, err = os.ReadFile(patchFile)
+		if err != nil {
+			return fmt.Errorf("failed to read patch file: %w", err)
+		}
+	} else {
+		patchData = []byte(patch)
+	}
+
+	var pt types.PatchType
+	switch patchType {
+	case "strategic":
+		pt = types.StrategicMergePatchType
+	case "merge":
+		pt = types.MergePatchType
+	case "json":
+		pt = types.JSONPatchType
+	default:
+		return fmt.Errorf("invalid patch type: %s (must be strategic, merge, or json)", patchType)
+	}
+
+	switch resourceType {
+	case "pods", "po":
+		_, err = clientset.CoreV1().Pods(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+	case "services", "svc":
+		_, err = clientset.CoreV1().Services(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+	case "deployments", "deploy":
+		_, err = clientset.AppsV1().Deployments(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+	default:
+		return fmt.Errorf("resource type %q not yet implemented for patch command", resourceType)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to patch resource: %w", err)
+	}
+
+	fmt.Fprintf(out, "✓ %s/%s patched\n", resourceType, resourceName)
+	return nil
+}
+

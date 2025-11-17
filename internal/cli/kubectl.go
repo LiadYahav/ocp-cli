@@ -1,3 +1,8 @@
+// Portions of this file are based on code from Kubernetes kubectl
+// under the Apache License 2.0.
+// Source: https://github.com/kubernetes/kubectl
+// See LICENSE and NOTICE files in the project root for full license information.
+
 package cli
 
 import (

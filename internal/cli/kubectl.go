@@ -64,6 +64,20 @@ var commonResources = []string{
 	"poddisruptionbudgets", "pdb",
 	"machineconfigpools", "mcp",
 	"routes",
+	// OpenShift resources
+	"buildconfigs", "bc",
+	"builds",
+	"deploymentconfigs", "dc",
+	"imagestreams", "is",
+	"imagestreamtags",
+	"imagestreamimages",
+	"templates",
+	"projects", "proj",
+	"clusterresourcequotas", "crq",
+	"securitycontextconstraints", "scc",
+	"networkattachmentdefinitions", "netattdef",
+	"clusteroperators", "co",
+	"clusterversions", "cv",
 }
 
 // Commands are exported individually to be added directly to root
@@ -138,7 +152,22 @@ Examples:
   ocp get mcp
 
   # Get a specific Machine Config Pool
-  ocp get mcp worker`,
+  ocp get mcp worker
+
+  # List Routes (OpenShift)
+  ocp get routes
+
+  # List BuildConfigs (OpenShift)
+  ocp get buildconfigs
+
+  # List DeploymentConfigs (OpenShift)
+  ocp get deploymentconfigs
+
+  # List ImageStreams (OpenShift)
+  ocp get imagestreams
+
+  # List ClusterOperators (OpenShift)
+  ocp get clusteroperators`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -195,7 +224,14 @@ Examples:
   ocp create -f deployment.yaml
 
   # Create from multiple files
-  ocp create -f file1.yaml -f file2.yaml`,
+  ocp create -f file1.yaml -f file2.yaml
+
+  # Create from stdin
+  cat route.yaml | ocp create -f -
+
+  # Create OpenShift resources
+  ocp create -f route.yaml
+  ocp create -f buildconfig.yaml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -275,7 +311,13 @@ Examples:
   ocp edit deployment my-app
 
   # Edit a pod
-  ocp edit pod my-pod`,
+  ocp edit pod my-pod
+
+  # Edit a Route (OpenShift)
+  ocp edit route my-route
+
+  # Edit a BuildConfig (OpenShift)
+  ocp edit buildconfig my-build`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -349,7 +391,11 @@ Examples:
   ocp delete pod pod1 pod2 pod3
 
   # Force delete (immediate removal)
-  ocp delete pod my-pod --force`,
+  ocp delete pod my-pod --force
+
+  # Delete OpenShift resources
+  ocp delete route my-route
+  ocp delete buildconfig my-build`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -428,8 +474,11 @@ Examples:
   # Describe a service
   ocp describe service my-svc
 
-  # Describe a Machine Config Pool (OpenShift)
-  ocp describe mcp worker`,
+  # Describe OpenShift resources
+  ocp describe mcp worker
+  ocp describe route my-route
+  ocp describe buildconfig my-build
+  ocp describe deploymentconfig my-app`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -566,7 +615,11 @@ Examples:
   cat deployment.yaml | ocp apply -f -
 
   # Force apply (recreate if necessary)
-  ocp apply -f deployment.yaml --force`,
+  ocp apply -f deployment.yaml --force
+
+  # Apply OpenShift resources
+  ocp apply -f route.yaml
+  ocp apply -f buildconfig.yaml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -654,7 +707,11 @@ Examples:
   ocp patch pod my-pod --type=merge -p '{"metadata":{"labels":{"new":"label"}}}'
 
   # Patch using JSON patch
-  ocp patch pod my-pod --type=json -p '[{"op":"replace","path":"/spec/containers/0/image","value":"new-image"}]'`,
+  ocp patch pod my-pod --type=json -p '[{"op":"replace","path":"/spec/containers/0/image","value":"new-image"}]'
+
+  # Patch OpenShift resources
+  ocp patch route my-route -p '{"spec":{"host":"new-host.example.com"}}'
+  ocp patch buildconfig my-build --type=merge -p '{"spec":{"source":{"type":"Git"}}}'`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -794,12 +851,67 @@ func normalizeResourceType(resourceType string) string {
 		"pdb":    "poddisruptionbudgets",
 		"mcp":    "machineconfigpools",
 		"route":  "routes",
+		// OpenShift aliases
+		"bc":        "buildconfigs",
+		"dc":        "deploymentconfigs",
+		"is":        "imagestreams",
+		"proj":      "projects",
+		"crq":       "clusterresourcequotas",
+		"scc":       "securitycontextconstraints",
+		"netattdef": "networkattachmentdefinitions",
+		"co":        "clusteroperators",
+		"cv":        "clusterversions",
 	}
 
 	if normalized, ok := aliasMap[resourceType]; ok {
 		return normalized
 	}
 	return resourceType
+}
+
+// getOpenShiftGVR returns the GroupVersionResource for an OpenShift resource type
+// Returns nil if the resource is not an OpenShift resource
+func getOpenShiftGVR(resourceType string) *schema.GroupVersionResource {
+	gvrMap := map[string]schema.GroupVersionResource{
+		"routes":                       {Group: "route.openshift.io", Version: "v1", Resource: "routes"},
+		"buildconfigs":                 {Group: "build.openshift.io", Version: "v1", Resource: "buildconfigs"},
+		"builds":                       {Group: "build.openshift.io", Version: "v1", Resource: "builds"},
+		"deploymentconfigs":            {Group: "apps.openshift.io", Version: "v1", Resource: "deploymentconfigs"},
+		"imagestreams":                 {Group: "image.openshift.io", Version: "v1", Resource: "imagestreams"},
+		"imagestreamtags":              {Group: "image.openshift.io", Version: "v1", Resource: "imagestreamtags"},
+		"imagestreamimages":            {Group: "image.openshift.io", Version: "v1", Resource: "imagestreamimages"},
+		"templates":                    {Group: "template.openshift.io", Version: "v1", Resource: "templates"},
+		"projects":                     {Group: "project.openshift.io", Version: "v1", Resource: "projects"},
+		"clusterresourcequotas":        {Group: "quota.openshift.io", Version: "v1", Resource: "clusterresourcequotas"},
+		"securitycontextconstraints":   {Group: "security.openshift.io", Version: "v1", Resource: "securitycontextconstraints"},
+		"networkattachmentdefinitions": {Group: "k8s.cni.cncf.io", Version: "v1", Resource: "networkattachmentdefinitions"},
+		"clusteroperators":             {Group: "config.openshift.io", Version: "v1", Resource: "clusteroperators"},
+		"clusterversions":              {Group: "config.openshift.io", Version: "v1", Resource: "clusterversions"},
+		"machineconfigpools":           {Group: "machineconfiguration.openshift.io", Version: "v1", Resource: "machineconfigpools"},
+	}
+
+	if gvr, ok := gvrMap[resourceType]; ok {
+		return &gvr
+	}
+	return nil
+}
+
+// isClusterScopedResource returns true if the resource is cluster-scoped
+func isClusterScopedResource(resourceType string) bool {
+	clusterScoped := map[string]bool{
+		"nodes":                        true,
+		"namespaces":                   true,
+		"persistentvolumes":            true,
+		"clusterroles":                 true,
+		"clusterrolebindings":          true,
+		"machineconfigpools":           true,
+		"clusteroperators":             true,
+		"clusterversions":              true,
+		"clusterresourcequotas":        true,
+		"securitycontextconstraints":   true,
+		"networkattachmentdefinitions": true,
+	}
+	return clusterScoped[resourceType]
 }
 
 func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, namespace string, allNamespaces bool) ([]string, error) {
@@ -1193,6 +1305,42 @@ func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, res
 		}
 
 	default:
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			var list *unstructured.UnstructuredList
+			if isClusterScopedResource(resourceType) {
+				list, err = dynamicClient.Resource(*gvr).List(ctx, metav1.ListOptions{})
+			} else {
+				if allNamespaces {
+					list, err = dynamicClient.Resource(*gvr).Namespace("").List(ctx, metav1.ListOptions{})
+				} else {
+					list, err = dynamicClient.Resource(*gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
+				}
+			}
+
+			if meta.IsNoMatchError(err) {
+				// CRD not available - return empty list for completion, but this will be caught in getResource
+				return []string{}, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			for _, item := range list.Items {
+				name, found, _ := unstructured.NestedString(item.Object, "metadata", "name")
+				if found && name != "" {
+					names = append(names, name)
+				}
+			}
+			return names, nil
+		}
+
 		return nil, fmt.Errorf("unsupported resource type: %s", resourceType)
 	}
 
@@ -1404,6 +1552,65 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 		return printRoutesTable(items, out, showLabels, allNamespaces, output == "wide")
 
 	default:
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			if resourceName != "" {
+				// Get single resource
+				var obj *unstructured.Unstructured
+				if isClusterScopedResource(resourceType) {
+					obj, err = dynamicClient.Resource(*gvr).Get(ctx, resourceName, metav1.GetOptions{})
+				} else {
+					obj, err = dynamicClient.Resource(*gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+				}
+
+				if meta.IsNoMatchError(err) {
+					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+				}
+				if err != nil {
+					return err
+				}
+				return printResource(obj, output, out)
+			}
+
+			// List resources
+			var list *unstructured.UnstructuredList
+			if isClusterScopedResource(resourceType) {
+				list, err = dynamicClient.Resource(*gvr).List(ctx, opts)
+			} else {
+				if allNamespaces {
+					list, err = dynamicClient.Resource(*gvr).Namespace("").List(ctx, opts)
+				} else {
+					list, err = dynamicClient.Resource(*gvr).Namespace(namespace).List(ctx, opts)
+				}
+			}
+
+			if meta.IsNoMatchError(err) {
+				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+			}
+			if err != nil {
+				return err
+			}
+
+			// Convert unstructured list to runtime.Object list for printResourceList
+			items, err := meta.ExtractList(list)
+			if err != nil {
+				return err
+			}
+
+			if output == "json" || output == "yaml" || output == "name" {
+				return printResourceList(list, output, out, allNamespaces, showLabels, resourceType)
+			}
+
+			// Use default table format for OpenShift resources
+			return printSimpleTable(items, out, allNamespaces, showLabels)
+		}
+
 		return fmt.Errorf("resource type %q not yet implemented for get command", resourceType)
 	}
 }
@@ -2994,7 +3201,21 @@ func editResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicC
 	case "deployments", "deploy":
 		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
 	default:
-		return fmt.Errorf("resource type %q not yet implemented for edit command", resourceType)
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			if isClusterScopedResource(resourceType) {
+				obj, err = dynamicClient.Resource(*gvr).Get(ctx, resourceName, metav1.GetOptions{})
+			} else {
+				obj, err = dynamicClient.Resource(*gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			}
+
+			if meta.IsNoMatchError(err) {
+				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+			}
+		} else {
+			return fmt.Errorf("resource type %q not yet implemented for edit command", resourceType)
+		}
 	}
 
 	if err != nil {
@@ -3066,6 +3287,22 @@ func editResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicC
 			return fmt.Errorf("failed to convert to Deployment: %w", err)
 		}
 		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, &deploy, metav1.UpdateOptions{})
+	default:
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			if isClusterScopedResource(resourceType) {
+				_, err = dynamicClient.Resource(*gvr).Update(ctx, &editedObj, metav1.UpdateOptions{})
+			} else {
+				_, err = dynamicClient.Resource(*gvr).Namespace(namespace).Update(ctx, &editedObj, metav1.UpdateOptions{})
+			}
+
+			if meta.IsNoMatchError(err) {
+				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+			}
+		} else {
+			return fmt.Errorf("resource type %q not yet implemented for edit command", resourceType)
+		}
 	}
 
 	if err != nil {
@@ -3158,7 +3395,7 @@ func deleteResources(ctx context.Context, clientset *kubernetes.Clientset, dynam
 		go func() {
 			defer wg.Done()
 			for res := range resourceChan {
-				err := deleteSingleResource(ctx, clientset, resourceType, res.name, res.namespace, force)
+				err := deleteSingleResource(ctx, clientset, dynamicClient, resourceType, res.name, res.namespace, force)
 				resultChan <- deleteResult{resource: res, err: err}
 			}
 		}()
@@ -3204,7 +3441,7 @@ type resourceIdentifier struct {
 	namespace string
 }
 
-func deleteSingleResource(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, resourceName string, namespace string, force bool) error {
+func deleteSingleResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, force bool) error {
 	opts := metav1.DeleteOptions{}
 	if force {
 		gracePeriod := int64(0)
@@ -3257,6 +3494,23 @@ func deleteSingleResource(ctx context.Context, clientset *kubernetes.Clientset, 
 	case "poddisruptionbudgets", "pdb":
 		return clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, resourceName, opts)
 	default:
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			if isClusterScopedResource(resourceType) {
+				err := dynamicClient.Resource(*gvr).Delete(ctx, resourceName, opts)
+				if meta.IsNoMatchError(err) {
+					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+				}
+				return err
+			} else {
+				err := dynamicClient.Resource(*gvr).Namespace(namespace).Delete(ctx, resourceName, opts)
+				if meta.IsNoMatchError(err) {
+					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+				}
+				return err
+			}
+		}
 		return fmt.Errorf("resource type %q not yet implemented for delete command", resourceType)
 	}
 }
@@ -3299,7 +3553,21 @@ func describeResource(ctx context.Context, clientset *kubernetes.Clientset, dyna
 			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
 		}
 	default:
-		return fmt.Errorf("resource type %q not yet implemented for describe command", resourceType)
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			if isClusterScopedResource(resourceType) {
+				obj, err = dynamicClient.Resource(*gvr).Get(ctx, resourceName, metav1.GetOptions{})
+			} else {
+				obj, err = dynamicClient.Resource(*gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			}
+
+			if meta.IsNoMatchError(err) {
+				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+			}
+		} else {
+			return fmt.Errorf("resource type %q not yet implemented for describe command", resourceType)
+		}
 	}
 
 	if err != nil {
@@ -3499,7 +3767,21 @@ func patchResource(ctx context.Context, clientset *kubernetes.Clientset, dynamic
 			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
 		}
 	default:
-		return fmt.Errorf("resource type %q not yet implemented for patch command", resourceType)
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			if isClusterScopedResource(resourceType) {
+				_, err = dynamicClient.Resource(*gvr).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+			} else {
+				_, err = dynamicClient.Resource(*gvr).Namespace(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+			}
+
+			if meta.IsNoMatchError(err) {
+				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+			}
+		} else {
+			return fmt.Errorf("resource type %q not yet implemented for patch command", resourceType)
+		}
 	}
 
 	if err != nil {

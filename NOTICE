@@ -6,6 +6,23 @@ Portions of this software are based on code from Kubernetes kubectl
 Portions of this software are based on patterns and concepts from OpenShift CLI
 (https://github.com/openshift/oc) under the Apache License 2.0.
 
+This product includes support for OpenShift-specific Custom Resource Definitions (CRDs)
+and resources, including but not limited to:
+- Routes (route.openshift.io/v1)
+- BuildConfigs and Builds (build.openshift.io/v1)
+- DeploymentConfigs (apps.openshift.io/v1)
+- ImageStreams, ImageStreamTags, ImageStreamImages (image.openshift.io/v1)
+- Templates (template.openshift.io/v1)
+- Projects (project.openshift.io/v1)
+- ClusterResourceQuotas (quota.openshift.io/v1)
+- SecurityContextConstraints (security.openshift.io/v1)
+- NetworkAttachmentDefinitions (k8s.cni.cncf.io/v1)
+- ClusterOperators and ClusterVersions (config.openshift.io/v1)
+- MachineConfigPools (machineconfiguration.openshift.io/v1)
+
+All OpenShift resources are accessed via the Kubernetes dynamic client API and follow
+the same patterns and concepts as the OpenShift CLI (oc).
+
 This product uses the following third-party libraries:
 
 - Kubernetes client-go (k8s.io/client-go)

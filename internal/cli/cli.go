@@ -35,7 +35,7 @@ func New() *CLI {
 }
 
 func (c *CLI) configure() {
-	c.root.PersistentFlags().StringP("config", "c", "", "Path to kubeconfig file")
+	c.root.PersistentFlags().String("config", "", "Path to kubeconfig file")
 
 	c.root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		configPath, err := cmd.Flags().GetString("config")

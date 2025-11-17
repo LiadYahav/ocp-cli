@@ -63,6 +63,7 @@ var commonResources = []string{
 	"clusterroles", "cr",
 	"poddisruptionbudgets", "pdb",
 	"machineconfigpools", "mcp",
+	"routes",
 }
 
 // Commands are exported individually to be added directly to root
@@ -791,6 +792,8 @@ func normalizeResourceType(resourceType string) string {
 		"crb":    "clusterrolebindings",
 		"cr":     "clusterroles",
 		"pdb":    "poddisruptionbudgets",
+		"mcp":    "machineconfigpools",
+		"route":  "routes",
 	}
 
 	if normalized, ok := aliasMap[resourceType]; ok {
@@ -1156,6 +1159,39 @@ func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, res
 			}
 		}
 
+	case "routes", "route":
+		dynamicClient, err := kube.NewDynamicClient(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+		}
+
+		gvr := schema.GroupVersionResource{
+			Group:    "route.openshift.io",
+			Version:  "v1",
+			Resource: "routes",
+		}
+
+		var routeList *unstructured.UnstructuredList
+		if allNamespaces {
+			routeList, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, metav1.ListOptions{})
+		} else {
+			routeList, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
+		}
+		if meta.IsNoMatchError(err) {
+			// API not available, return empty list
+			return []string{}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		for _, route := range routeList.Items {
+			name, found, _ := unstructured.NestedString(route.Object, "metadata", "name")
+			if found && name != "" {
+				names = append(names, name)
+			}
+		}
+
 	default:
 		return nil, fmt.Errorf("unsupported resource type: %s", resourceType)
 	}
@@ -1317,6 +1353,55 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 
 		// Use custom table format for MCP
 		return printMCPTable(items, out, showLabels, false)
+
+	case "routes", "route":
+		dynamicClient, err := kube.NewDynamicClient(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create dynamic client: %w", err)
+		}
+
+		gvr := schema.GroupVersionResource{
+			Group:    "route.openshift.io",
+			Version:  "v1",
+			Resource: "routes",
+		}
+
+		if resourceName != "" {
+			route, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+			if meta.IsNoMatchError(err) {
+				return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
+			}
+			if err != nil {
+				return err
+			}
+			return printResource(route, output, out)
+		}
+
+		var routeList *unstructured.UnstructuredList
+		if allNamespaces {
+			routeList, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, opts)
+		} else {
+			routeList, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, opts)
+		}
+		if meta.IsNoMatchError(err) {
+			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
+		}
+		if err != nil {
+			return err
+		}
+
+		// Convert unstructured list to runtime.Object list for printResourceList
+		items, err := meta.ExtractList(routeList)
+		if err != nil {
+			return err
+		}
+
+		if output == "json" || output == "yaml" || output == "name" {
+			return printResourceList(routeList, output, out, allNamespaces, showLabels, resourceType)
+		}
+
+		// Use custom table format for Routes
+		return printRoutesTable(items, out, showLabels, allNamespaces, output == "wide")
 
 	default:
 		return fmt.Errorf("resource type %q not yet implemented for get command", resourceType)
@@ -2523,6 +2608,222 @@ func printMCPTable(items []runtime.Object, out io.Writer, showLabels bool, wide 
 	return nil
 }
 
+func printRoutesTable(items []runtime.Object, out io.Writer, showLabels bool, allNamespaces bool, wide bool) error {
+	type routeData struct {
+		namespace   string
+		name        string
+		host        string
+		path        string
+		services    string
+		port        string
+		termination string
+		wildcard    string
+		age         string
+		labels      string
+	}
+
+	var routeList []routeData
+	widths := map[string]int{
+		"name":        len("NAME"),
+		"host":        len("HOST/PORT"),
+		"path":        len("PATH"),
+		"services":    len("SERVICES"),
+		"port":        len("PORT"),
+		"termination": len("TERMINATION"),
+		"wildcard":    len("WILDCARD"),
+		"age":         len("AGE"),
+	}
+
+	if allNamespaces {
+		widths["namespace"] = len("NAMESPACE")
+	}
+
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		route, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+
+		name, _, _ := unstructured.NestedString(route.Object, "metadata", "name")
+		namespace, _, _ := unstructured.NestedString(route.Object, "metadata", "namespace")
+		creationTimestamp, _, _ := unstructured.NestedString(route.Object, "metadata", "creationTimestamp")
+
+		// Get host from spec.host
+		host, _, _ := unstructured.NestedString(route.Object, "spec", "host")
+		if host == "" {
+			host = "<none>"
+		}
+
+		// Get path from spec.path
+		path, _, _ := unstructured.NestedString(route.Object, "spec", "path")
+		if path == "" {
+			path = "<none>"
+		}
+
+		// Get service from spec.to.name
+		services, _, _ := unstructured.NestedString(route.Object, "spec", "to", "name")
+		if services == "" {
+			services = "<none>"
+		}
+
+		// Get port from spec.port.targetPort
+		var port string
+		if portVal, found, _ := unstructured.NestedFieldNoCopy(route.Object, "spec", "port", "targetPort"); found {
+			if portStr, ok := portVal.(string); ok {
+				port = portStr
+			} else if portInt, ok := portVal.(int64); ok {
+				port = fmt.Sprintf("%d", portInt)
+			} else {
+				port = "<none>"
+			}
+		} else {
+			port = "<none>"
+		}
+
+		// Get termination from spec.tls.termination
+		termination, _, _ := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+		if termination == "" {
+			termination = "<none>"
+		}
+
+		// Get wildcard from spec.wildcardPolicy
+		wildcard, _, _ := unstructured.NestedString(route.Object, "spec", "wildcardPolicy")
+		if wildcard == "" {
+			wildcard = "<none>"
+		}
+
+		// Calculate age
+		var age string
+		if creationTimestamp != "" {
+			createdTime, err := time.Parse(time.RFC3339, creationTimestamp)
+			if err == nil {
+				age = formatAge(createdTime)
+			} else {
+				age = "<unknown>"
+			}
+		} else {
+			age = "<unknown>"
+		}
+
+		// Get labels if needed
+		labels := "<none>"
+		if showLabels {
+			labelMap, _, _ := unstructured.NestedMap(route.Object, "metadata", "labels")
+			if len(labelMap) > 0 {
+				labelPairs := make([]string, 0, len(labelMap))
+				for k, v := range labelMap {
+					if vStr, ok := v.(string); ok {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, vStr))
+					}
+				}
+				labels = strings.Join(labelPairs, ",")
+			}
+		}
+
+		data := routeData{
+			namespace:   namespace,
+			name:        name,
+			host:        host,
+			path:        path,
+			services:    services,
+			port:        port,
+			termination: termination,
+			wildcard:    wildcard,
+			age:         age,
+			labels:      labels,
+		}
+
+		routeList = append(routeList, data)
+
+		// Update widths
+		if allNamespaces && len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.host) > widths["host"] {
+			widths["host"] = len(data.host)
+		}
+		if len(data.path) > widths["path"] {
+			widths["path"] = len(data.path)
+		}
+		if len(data.services) > widths["services"] {
+			widths["services"] = len(data.services)
+		}
+		if len(data.port) > widths["port"] {
+			widths["port"] = len(data.port)
+		}
+		if len(data.termination) > widths["termination"] {
+			widths["termination"] = len(data.termination)
+		}
+		if len(data.wildcard) > widths["wildcard"] {
+			widths["wildcard"] = len(data.wildcard)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(routeList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["host"]),
+		fmt.Sprintf("%%-%ds", widths["path"]),
+		fmt.Sprintf("%%-%ds", widths["services"]),
+		fmt.Sprintf("%%-%ds", widths["port"]),
+		fmt.Sprintf("%%-%ds", widths["termination"]),
+		fmt.Sprintf("%%-%ds", widths["wildcard"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+
+	headerParts = append(headerParts, "NAME", "HOST/PORT", "PATH", "SERVICES", "PORT", "TERMINATION", "WILDCARD", "AGE")
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each route
+	for _, data := range routeList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.host, data.path, data.services, data.port, data.termination, data.wildcard, data.age)
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
 func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool) error {
 	// Fallback simple table
 	if len(items) == 0 {
@@ -2987,6 +3288,16 @@ func describeResource(ctx context.Context, clientset *kubernetes.Clientset, dyna
 		if meta.IsNoMatchError(err) {
 			return fmt.Errorf("machine config pool API not available - ensure you're connected to an OpenShift cluster")
 		}
+	case "routes", "route":
+		gvr := schema.GroupVersionResource{
+			Group:    "route.openshift.io",
+			Version:  "v1",
+			Resource: "routes",
+		}
+		obj, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+		if meta.IsNoMatchError(err) {
+			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
+		}
 	default:
 		return fmt.Errorf("resource type %q not yet implemented for describe command", resourceType)
 	}
@@ -3177,6 +3488,16 @@ func patchResource(ctx context.Context, clientset *kubernetes.Clientset, dynamic
 		_, err = clientset.CoreV1().Services(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
 	case "deployments", "deploy":
 		_, err = clientset.AppsV1().Deployments(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+	case "routes", "route":
+		gvr := schema.GroupVersionResource{
+			Group:    "route.openshift.io",
+			Version:  "v1",
+			Resource: "routes",
+		}
+		_, err = dynamicClient.Resource(gvr).Namespace(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+		if meta.IsNoMatchError(err) {
+			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
+		}
 	default:
 		return fmt.Errorf("resource type %q not yet implemented for patch command", resourceType)
 	}

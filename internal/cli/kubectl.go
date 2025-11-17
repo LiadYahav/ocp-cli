@@ -3791,3 +3791,593 @@ func patchResource(ctx context.Context, clientset *kubernetes.Clientset, dynamic
 	fmt.Fprintf(out, "✓ %s/%s patched\n", resourceType, resourceName)
 	return nil
 }
+
+func newAnnotateCommand() *cobra.Command {
+	var namespace string
+	var allNamespaces bool
+	var resourceNames []string
+	var maxConcurrency int
+
+	cmd := &cobra.Command{
+		Use:   "annotate <resource-type> <resource-name> <annotation> [flags]",
+		Short: "Update the annotations on one or more resources",
+		Long: `Update annotations on one or more resources.
+
+Annotations should be in the format "key=value" (to add/update) or "key" (to remove).
+Multiple annotations can be specified separated by commas (no spaces).
+
+Examples:
+  # Add an annotation to a pod
+  ocp annotate pod my-pod description="My pod"
+
+  # Add multiple annotations
+  ocp annotate pod my-pod key1=value1,key2=value2
+
+  # Remove an annotation
+  ocp annotate pod my-pod description
+
+  # Annotate multiple resources
+  ocp annotate pod pod1 pod2 key=value
+
+  # Annotate OpenShift resources
+  ocp annotate route my-route description="My route"`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.MinimumNArgs(3),
+		Example: `  # Add an annotation to a pod
+  ocp annotate pod my-pod description="My pod"
+
+  # Add multiple annotations
+  ocp annotate pod my-pod key1=value1,key2=value2,key3=value3
+
+  # Remove an annotation
+  ocp annotate pod my-pod description
+
+  # Annotate multiple pods
+  ocp annotate pod pod1 pod2 pod3 environment=production
+
+  # Annotate a deployment
+  ocp annotate deployment my-app version=1.0.0
+
+  # Annotate OpenShift resources
+  ocp annotate route my-route description="My route"
+  ocp annotate buildconfig my-build build.openshift.io/source-location="git://example.com/repo"`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			resourceType := args[0]
+			resourceNames = args[1 : len(args)-1]
+			annotationsStr := args[len(args)-1]
+
+			if len(resourceNames) == 0 {
+				return fmt.Errorf("must specify at least one resource name")
+			}
+
+			ns := resolveNamespace(ctx, namespace, allNamespaces)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			if maxConcurrency <= 0 {
+				maxConcurrency = 10
+			}
+
+			return annotateResources(ctx, clientset, dynamicClient, resourceType, resourceNames, ns, allNamespaces, annotationsStr, maxConcurrency, cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Annotate resources in all namespaces")
+	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 10, "Maximum number of concurrent annotation operations")
+
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+
+	return cmd
+}
+
+func newLabelCommand() *cobra.Command {
+	var namespace string
+	var allNamespaces bool
+	var resourceNames []string
+	var maxConcurrency int
+
+	cmd := &cobra.Command{
+		Use:   "label <resource-type> <resource-name> <label> [flags]",
+		Short: "Update the labels on one or more resources",
+		Long: `Update labels on one or more resources.
+
+Labels should be in the format "key=value" (to add/update) or "key-" (to remove).
+Multiple labels can be specified separated by commas (no spaces).
+
+Examples:
+  # Add a label to a pod
+  ocp label pod my-pod environment=production
+
+  # Add multiple labels
+  ocp label pod my-pod key1=value1,key2=value2
+
+  # Remove a label
+  ocp label pod my-pod environment-
+
+  # Label multiple resources
+  ocp label pod pod1 pod2 team=platform
+
+  # Label OpenShift resources
+  ocp label route my-route app=myapp`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+			}
+			if len(args) == 1 {
+				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.MinimumNArgs(3),
+		Example: `  # Add a label to a pod
+  ocp label pod my-pod environment=production
+
+  # Add multiple labels
+  ocp label pod my-pod key1=value1,key2=value2,key3=value3
+
+  # Remove a label
+  ocp label pod my-pod environment-
+
+  # Label multiple pods
+  ocp label pod pod1 pod2 pod3 team=platform
+
+  # Label a deployment
+  ocp label deployment my-app version=1.0.0
+
+  # Label OpenShift resources
+  ocp label route my-route app=myapp
+  ocp label buildconfig my-build build.openshift.io/source-location=git`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+
+			resourceType := args[0]
+			resourceNames = args[1 : len(args)-1]
+			labelsStr := args[len(args)-1]
+
+			if len(resourceNames) == 0 {
+				return fmt.Errorf("must specify at least one resource name")
+			}
+
+			ns := resolveNamespace(ctx, namespace, allNamespaces)
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to create dynamic client: %w", err)
+			}
+
+			if maxConcurrency <= 0 {
+				maxConcurrency = 10
+			}
+
+			return labelResources(ctx, clientset, dynamicClient, resourceType, resourceNames, ns, allNamespaces, labelsStr, maxConcurrency, cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+	cmd.Flags().BoolVarP(&allNamespaces, "all-namespaces", "A", false, "Label resources in all namespaces")
+	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 10, "Maximum number of concurrent label operations")
+
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+
+	return cmd
+}
+
+func annotateResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceNames []string, namespace string, allNamespaces bool, annotationsStr string, maxConcurrency int, out io.Writer, errOut io.Writer) error {
+	resourceType = normalizeResourceType(resourceType)
+
+	// Parse comma-separated annotations
+	annotationParts := strings.Split(annotationsStr, ",")
+	var patchOps []string
+	var needsAnnotationsInit bool
+	var addedKeys []string
+	var removedKeys []string
+
+	// Build patch operations
+	for _, annotation := range annotationParts {
+		annotation = strings.TrimSpace(annotation)
+		if annotation == "" {
+			continue
+		}
+
+		// Parse annotation key=value or key (remove)
+		parts := strings.SplitN(annotation, "=", 2)
+		key := parts[0]
+		var value string
+		var remove bool
+
+		if len(parts) == 2 {
+			value = parts[1]
+			remove = false
+		} else {
+			remove = true
+		}
+
+		if remove {
+			// Remove annotation
+			escapedKey := strings.ReplaceAll(key, "/", "~1")
+			patchOps = append(patchOps, fmt.Sprintf(`{"op":"remove","path":"/metadata/annotations/%s"}`, escapedKey))
+			removedKeys = append(removedKeys, key)
+		} else {
+			// Add or update annotation
+			if !needsAnnotationsInit {
+				needsAnnotationsInit = true
+			}
+			escapedKey := strings.ReplaceAll(key, "/", "~1")
+			// JSON escape the value
+			jsonEscapedValue, err := json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("failed to escape annotation value for key %q: %w", key, err)
+			}
+			// Remove surrounding quotes from marshaled JSON string
+			jsonValueStr := string(jsonEscapedValue[1 : len(jsonEscapedValue)-1])
+			patchOps = append(patchOps, fmt.Sprintf(`{"op":"add","path":"/metadata/annotations/%s","value":"%s"}`, escapedKey, jsonValueStr))
+			addedKeys = append(addedKeys, key)
+		}
+	}
+
+	if len(patchOps) == 0 {
+		return fmt.Errorf("no valid annotations provided")
+	}
+
+	// Build patch with initialization if needed
+	var patch string
+	if needsAnnotationsInit {
+		patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/annotations","value":{}},%s]`, strings.Join(patchOps, ","))
+	} else {
+		patch = fmt.Sprintf(`[%s]`, strings.Join(patchOps, ","))
+	}
+
+	// Use worker pool for concurrent annotation
+	type annotateResult struct {
+		resourceName string
+		namespace    string
+		err          error
+	}
+
+	// Normalize resource type once
+	normalizedResourceType := normalizeResourceType(resourceType)
+	isClusterScoped := isClusterScopedResource(normalizedResourceType)
+
+	resourceChan := make(chan string, len(resourceNames))
+	resultChan := make(chan annotateResult, len(resourceNames))
+
+	for _, name := range resourceNames {
+		resourceChan <- name
+	}
+	close(resourceChan)
+
+	var wg sync.WaitGroup
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for resourceName := range resourceChan {
+				// Use empty namespace for cluster-scoped resources
+				ns := namespace
+				if isClusterScoped {
+					ns = ""
+				}
+				err := annotateSingleResource(ctx, clientset, dynamicClient, normalizedResourceType, resourceName, ns, patch)
+				resultChan <- annotateResult{resourceName: resourceName, namespace: ns, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	var annotatedCount int
+	var failedCount int
+	var failedResources []string
+
+	for result := range resultChan {
+		if result.err != nil {
+			if result.namespace != "" {
+				fmt.Fprintf(errOut, "✗ Failed to annotate %s/%s: %v\n", result.namespace, result.resourceName, result.err)
+				failedResources = append(failedResources, fmt.Sprintf("%s/%s", result.namespace, result.resourceName))
+			} else {
+				fmt.Fprintf(errOut, "✗ Failed to annotate %s: %v\n", result.resourceName, result.err)
+				failedResources = append(failedResources, result.resourceName)
+			}
+			failedCount++
+		} else {
+			if result.namespace != "" {
+				fmt.Fprintf(out, "✓ Annotated %s/%s\n", result.namespace, result.resourceName)
+			} else {
+				fmt.Fprintf(out, "✓ Annotated %s\n", result.resourceName)
+			}
+			annotatedCount++
+		}
+	}
+
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Annotated: %d\n", annotatedCount)
+	fmt.Fprintf(out, "Failed: %d\n", failedCount)
+	if len(addedKeys) > 0 {
+		fmt.Fprintf(out, "Annotations added/updated: %v\n", addedKeys)
+	}
+	if len(removedKeys) > 0 {
+		fmt.Fprintf(out, "Annotations removed: %v\n", removedKeys)
+	}
+
+	if failedCount > 0 {
+		fmt.Fprintf(errOut, "\n✗ Failed to annotate:\n")
+		for _, res := range failedResources {
+			fmt.Fprintf(errOut, "  - %s\n", res)
+		}
+		return fmt.Errorf("failed to annotate %d resource(s)", failedCount)
+	}
+
+	return nil
+}
+
+func annotateSingleResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, patch string) error {
+	resourceType = normalizeResourceType(resourceType)
+	patchData := []byte(patch)
+
+	switch resourceType {
+	case "pods", "po":
+		_, err := clientset.CoreV1().Pods(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "services", "svc":
+		_, err := clientset.CoreV1().Services(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "deployments", "deploy":
+		_, err := clientset.AppsV1().Deployments(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "nodes", "no":
+		_, err := clientset.CoreV1().Nodes().Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "namespaces", "ns":
+		_, err := clientset.CoreV1().Namespaces().Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	default:
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			if isClusterScopedResource(resourceType) {
+				_, err := dynamicClient.Resource(*gvr).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+				if meta.IsNoMatchError(err) {
+					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+				}
+				return err
+			} else {
+				_, err := dynamicClient.Resource(*gvr).Namespace(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+				if meta.IsNoMatchError(err) {
+					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+				}
+				return err
+			}
+		}
+		return fmt.Errorf("resource type %q not yet implemented for annotate command", resourceType)
+	}
+}
+
+func labelResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceNames []string, namespace string, allNamespaces bool, labelsStr string, maxConcurrency int, out io.Writer, errOut io.Writer) error {
+	resourceType = normalizeResourceType(resourceType)
+
+	// Parse comma-separated labels
+	labelParts := strings.Split(labelsStr, ",")
+	var patchOps []string
+	var needsLabelsInit bool
+	var addedKeys []string
+	var removedKeys []string
+
+	// Build patch operations
+	for _, label := range labelParts {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+
+		// Parse label key=value or key- (remove)
+		var key, value string
+		var remove bool
+
+		if strings.HasSuffix(label, "-") {
+			key = strings.TrimSuffix(label, "-")
+			remove = true
+		} else {
+			parts := strings.SplitN(label, "=", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid label format: expected key=value or key-, got %q", label)
+			}
+			key = parts[0]
+			value = parts[1]
+			remove = false
+		}
+
+		if remove {
+			// Remove label
+			escapedKey := strings.ReplaceAll(key, "/", "~1")
+			patchOps = append(patchOps, fmt.Sprintf(`{"op":"remove","path":"/metadata/labels/%s"}`, escapedKey))
+			removedKeys = append(removedKeys, key)
+		} else {
+			// Add or update label
+			if !needsLabelsInit {
+				needsLabelsInit = true
+			}
+			escapedKey := strings.ReplaceAll(key, "/", "~1")
+			// JSON escape the value
+			jsonEscapedValue, err := json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("failed to escape label value for key %q: %w", key, err)
+			}
+			// Remove surrounding quotes from marshaled JSON string
+			jsonValueStr := string(jsonEscapedValue[1 : len(jsonEscapedValue)-1])
+			patchOps = append(patchOps, fmt.Sprintf(`{"op":"add","path":"/metadata/labels/%s","value":"%s"}`, escapedKey, jsonValueStr))
+			addedKeys = append(addedKeys, key)
+		}
+	}
+
+	if len(patchOps) == 0 {
+		return fmt.Errorf("no valid labels provided")
+	}
+
+	// Build patch with initialization if needed
+	var patch string
+	if needsLabelsInit {
+		patch = fmt.Sprintf(`[{"op":"add","path":"/metadata/labels","value":{}},%s]`, strings.Join(patchOps, ","))
+	} else {
+		patch = fmt.Sprintf(`[%s]`, strings.Join(patchOps, ","))
+	}
+
+	// Use worker pool for concurrent labeling
+	type labelResult struct {
+		resourceName string
+		namespace    string
+		err          error
+	}
+
+	// Normalize resource type once
+	normalizedResourceType := normalizeResourceType(resourceType)
+	isClusterScoped := isClusterScopedResource(normalizedResourceType)
+
+	resourceChan := make(chan string, len(resourceNames))
+	resultChan := make(chan labelResult, len(resourceNames))
+
+	for _, name := range resourceNames {
+		resourceChan <- name
+	}
+	close(resourceChan)
+
+	var wg sync.WaitGroup
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for resourceName := range resourceChan {
+				// Use empty namespace for cluster-scoped resources
+				ns := namespace
+				if isClusterScoped {
+					ns = ""
+				}
+				err := labelSingleResource(ctx, clientset, dynamicClient, normalizedResourceType, resourceName, ns, patch)
+				resultChan <- labelResult{resourceName: resourceName, namespace: ns, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	var labeledCount int
+	var failedCount int
+	var failedResources []string
+
+	for result := range resultChan {
+		if result.err != nil {
+			if result.namespace != "" {
+				fmt.Fprintf(errOut, "✗ Failed to label %s/%s: %v\n", result.namespace, result.resourceName, result.err)
+				failedResources = append(failedResources, fmt.Sprintf("%s/%s", result.namespace, result.resourceName))
+			} else {
+				fmt.Fprintf(errOut, "✗ Failed to label %s: %v\n", result.resourceName, result.err)
+				failedResources = append(failedResources, result.resourceName)
+			}
+			failedCount++
+		} else {
+			if result.namespace != "" {
+				fmt.Fprintf(out, "✓ Labeled %s/%s\n", result.namespace, result.resourceName)
+			} else {
+				fmt.Fprintf(out, "✓ Labeled %s\n", result.resourceName)
+			}
+			labeledCount++
+		}
+	}
+
+	fmt.Fprintf(out, "\n=== Summary ===\n")
+	fmt.Fprintf(out, "Labeled: %d\n", labeledCount)
+	fmt.Fprintf(out, "Failed: %d\n", failedCount)
+	if len(addedKeys) > 0 {
+		fmt.Fprintf(out, "Labels added/updated: %v\n", addedKeys)
+	}
+	if len(removedKeys) > 0 {
+		fmt.Fprintf(out, "Labels removed: %v\n", removedKeys)
+	}
+
+	if failedCount > 0 {
+		fmt.Fprintf(errOut, "\n✗ Failed to label:\n")
+		for _, res := range failedResources {
+			fmt.Fprintf(errOut, "  - %s\n", res)
+		}
+		return fmt.Errorf("failed to label %d resource(s)", failedCount)
+	}
+
+	return nil
+}
+
+func labelSingleResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, patch string) error {
+	resourceType = normalizeResourceType(resourceType)
+	patchData := []byte(patch)
+
+	switch resourceType {
+	case "pods", "po":
+		_, err := clientset.CoreV1().Pods(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "services", "svc":
+		_, err := clientset.CoreV1().Services(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "deployments", "deploy":
+		_, err := clientset.AppsV1().Deployments(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "nodes", "no":
+		_, err := clientset.CoreV1().Nodes().Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	case "namespaces", "ns":
+		_, err := clientset.CoreV1().Namespaces().Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+		return err
+	default:
+		// Try OpenShift resources
+		gvr := getOpenShiftGVR(resourceType)
+		if gvr != nil {
+			if isClusterScopedResource(resourceType) {
+				_, err := dynamicClient.Resource(*gvr).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+				if meta.IsNoMatchError(err) {
+					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+				}
+				return err
+			} else {
+				_, err := dynamicClient.Resource(*gvr).Namespace(namespace).Patch(ctx, resourceName, types.JSONPatchType, patchData, metav1.PatchOptions{})
+				if meta.IsNoMatchError(err) {
+					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
+				}
+				return err
+			}
+		}
+		return fmt.Errorf("resource type %q not yet implemented for label command", resourceType)
+	}
+}

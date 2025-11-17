@@ -23,6 +23,16 @@ func New() *CLI {
 		Short:         "OCP team CLI",
 		SilenceUsage:  false, // Show usage on error to help users
 		SilenceErrors: false, // Show errors properly
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// Complete subcommand names
+			var completions []string
+			for _, subCmd := range cmd.Commands() {
+				if strings.HasPrefix(subCmd.Name(), toComplete) {
+					completions = append(completions, subCmd.Name())
+				}
+			}
+			return completions, cobra.ShellCompDirectiveNoFileComp
+		},
 	}
 
 	c := &CLI{
@@ -79,6 +89,8 @@ func (c *CLI) configure() {
 		newLogsCommand(),
 		newApplyCommand(),
 		newPatchCommand(),
+		newAnnotateCommand(),
+		newLabelCommand(),
 		newVersionCommand(),
 		newCompletionCommand(c.root),
 	)

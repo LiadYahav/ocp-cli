@@ -11,7 +11,7 @@ A powerful command-line tool for managing OpenShift and Kubernetes clusters, des
 - **Cluster Operations**: Configure DNS, monitor cluster health, and view cluster information
 - **Machine Config Pool Management**: Pause and resume Machine Config Pools
 - **Project Namespace Management**: Set default namespace for all namespace-scoped commands
-- **Kubectl-like Commands**: Full support for `get`, `create`, `edit`, `delete`, `describe`, `logs`, `apply`, `patch`, `annotate`, and `label` (no external dependencies - fully self-contained)
+- **Kubectl-like Commands**: Full support for `get`, `create`, `edit`, `delete`, `describe`, `logs`, `apply`, `patch`, `annotate`, `label`, and `clearyml` (no external dependencies - fully self-contained)
 - **Shell Completion**: Full bash/zsh/fish completion support for all commands and resources
 - **Concurrent Operations**: Parallel execution for multi-resource operations with configurable concurrency
 - **Error Handling**: Robust error handling with retry logic and detailed error messages
@@ -483,6 +483,49 @@ ocp label pods -l app=myapp key=value
 ocp label pods -l app=myapp key=value --max-concurrency 10
 ```
 
+#### Get Cleaned YAML
+
+Get cleaned YAML output for resources with unnecessary fields removed. Perfect for version control or applying resources.
+
+```bash
+# Get cleaned YAML for a specific pod
+ocp clearyml pod my-pod --namespace default
+
+# Get cleaned YAML for ALL pods in a namespace (no resource name)
+ocp clearyml pods --namespace default
+
+# Get cleaned YAML for ALL deployments in a namespace
+ocp clearyml deployment --namespace test-ns
+
+# Get cleaned YAML for a specific deployment
+ocp clearyml deployment my-app --namespace default
+
+# Get cleaned YAML for cluster-scoped resource (no namespace needed)
+ocp clearyml node worker-0
+
+# Get cleaned YAML for ALL nodes
+ocp clearyml nodes
+
+# Get cleaned YAML for OpenShift resources
+ocp clearyml routes --namespace default
+ocp clearyml route my-route --namespace default
+
+# Get cleaned YAML for custom resources (CRDs)
+ocp clearyml mycustomresource my-instance --namespace default
+
+# Using short form -n flag
+ocp clearyml deployment -n test-ns
+ocp clearyml pods -n default
+```
+
+The `clearyml` command automatically removes:
+- `status` fields (runtime data)
+- `metadata.uid`, `metadata.resourceVersion`, `metadata.generation`
+- `metadata.creationTimestamp`, `metadata.managedFields`
+- Empty and null fields
+
+It preserves all important fields like `spec`, `metadata.name`, `metadata.namespace`, `metadata.labels`, and `metadata.annotations`.
+
 ## Shell Completion
 
 Generate shell completion scripts:
@@ -589,6 +632,16 @@ ocp label deployments -l app=myapp environment=production
 
 # Annotate all services
 ocp annotate services -l app=myapp managed-by=ocp-cli
+
+# Get cleaned YAML for all deployments in a namespace
+ocp clearyml deployment --namespace test-ns
+
+# Get cleaned YAML for all pods in a namespace
+ocp clearyml pods --namespace default
+
+# Using short form
+ocp clearyml deployment -n test-ns
+ocp clearyml pods -n default
 ```
 
 ## Command Reference

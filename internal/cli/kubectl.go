@@ -4364,3 +4364,346 @@ func labelSingleResource(ctx context.Context, clientset *kubernetes.Clientset, d
 		return fmt.Errorf("resource type %q not yet implemented for label command", resourceType)
 	}
 }
+
+func newClearYMLCommand() *cobra.Command {
+	var namespace string
+
+	cmd := &cobra.Command{
+		Use:   "clearyml <resource-type> [resource-name]",
+		Short: "Get cleaned YAML output for resources",
+		Long: `Get cleaned YAML output for Kubernetes resources with unnecessary fields removed.
+
+This command fetches resources and outputs clean YAML suitable for applying or version control.
+It automatically removes:
+- status fields (runtime data)
+- metadata.uid, metadata.resourceVersion, metadata.generation
+- metadata.creationTimestamp, metadata.managedFields
+- Empty and null fields
+
+The cleaned YAML preserves:
+- All spec fields
+- metadata.name, metadata.namespace
+- metadata.labels and metadata.annotations
+- All other important metadata
+
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
+Smart argument parsing:
+- If resource-name is omitted, lists ALL resources of that type in the namespace
+- Namespace can be provided via --namespace or -n flag (recommended) or as positional argument
+- For cluster-scoped resources, namespace is not needed
+- Use: --namespace <namespace> or -n <namespace> (space-separated, no equals sign needed)
+
+Examples:
+  # Get cleaned YAML for a specific pod
+  ocp clearyml pod my-pod --namespace default
+
+  # Get cleaned YAML for ALL pods in a namespace (no resource name specified)
+  ocp clearyml pods --namespace default
+
+  # Get cleaned YAML for ALL deployments in a namespace
+  ocp clearyml deployment --namespace test-ns
+
+  # Get cleaned YAML for a specific deployment
+  ocp clearyml deployment my-app --namespace default
+
+  # Get cleaned YAML for cluster-scoped resource (namespace not needed)
+  ocp clearyml node worker-0
+
+  # Get cleaned YAML for ALL nodes (cluster-scoped, no namespace needed)
+  ocp clearyml nodes
+
+  # Get cleaned YAML for any OpenShift resource
+  ocp clearyml route my-route --namespace default
+
+  # Get cleaned YAML for ALL routes in a namespace
+  ocp clearyml routes --namespace default
+
+  # Get cleaned YAML for any custom resource (CRD)
+  ocp clearyml mycustomresource my-instance --namespace default`,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) == 0 {
+				return completeResourceTypes(cmd, toComplete)
+			}
+			if len(args) == 1 {
+				ns, _ := cmd.Flags().GetString("namespace")
+				return completeResourceNames(cmd, args[0], toComplete, ns, false)
+			}
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		},
+		Args: cobra.RangeArgs(1, 3),
+		Example: `  # Get cleaned YAML for a specific pod
+  ocp clearyml pod my-pod --namespace default
+
+  # Get cleaned YAML for ALL pods in a namespace (no resource name)
+  ocp clearyml pods --namespace default
+
+  # Get cleaned YAML for ALL deployments in a namespace
+  ocp clearyml deployment --namespace test-ns
+
+  # Get cleaned YAML for a specific deployment
+  ocp clearyml deployment my-app --namespace default
+
+  # Get cleaned YAML for cluster-scoped resource (no namespace needed)
+  ocp clearyml node worker-0
+
+  # Get cleaned YAML for ALL nodes
+  ocp clearyml nodes`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := ensureContext(cmd.Context())
+
+			resourceType := args[0]
+			var resourceName string
+			var ns string
+
+			// Smart argument parsing:
+			// Format: clearyml <resource-type> <namespace> [resource-name]
+			// But also support: clearyml <resource-type> [resource-name] --namespace <ns> or -n <ns>
+
+			// First, resolve resource type to check if it's namespaced
+			resolver, err := getResourceResolver(ctx)
+			if err != nil {
+				return formatErrorWithContext(err, "getResourceResolver", resourceType, "", "")
+			}
+
+			_, namespaced, err := resolver.resolveResource(resourceType)
+			if err != nil {
+				return formatErrorWithContext(err, "resolveResource", resourceType, "", "")
+			}
+
+			// If namespace flag is set, it takes precedence
+			if namespace != "" {
+				// Format: clearyml <resource-type> [resource-name] --namespace <ns> or -n <ns>
+				if len(args) >= 2 {
+					resourceName = args[1]
+				} else {
+					resourceName = "" // List all resources of this type in namespace
+				}
+				ns = namespace
+			} else {
+				// Positional arguments: clearyml <resource-type> <namespace> [resource-name]
+				if namespaced {
+					// Namespaced resource - require namespace
+					if len(args) == 1 {
+						// Just resource type - use current project namespace
+						ns = resolveNamespace(ctx, "", false)
+						if ns == "" {
+							return fmt.Errorf("namespace is required for namespaced resource %q. Provide namespace as second argument or use --namespace flag", resourceType)
+						}
+						resourceName = ""
+					} else if len(args) == 2 {
+						// resource-type namespace - list all
+						ns = args[1]
+						resourceName = ""
+					} else if len(args) == 3 {
+						// resource-type namespace resource-name
+						ns = args[1]
+						resourceName = args[2]
+					}
+				} else {
+					// Cluster-scoped resource - namespace not needed
+					if len(args) == 2 {
+						// resource-type resource-name
+						resourceName = args[1]
+						ns = ""
+					} else if len(args) == 1 {
+						// resource-type - list all cluster-scoped resources
+						resourceName = ""
+						ns = ""
+					} else if len(args) == 3 {
+						// resource-type "" resource-name (explicit empty namespace)
+						if args[1] == "" {
+							ns = ""
+							resourceName = args[2]
+						} else {
+							// Treat as: resource-type namespace resource-name (but namespace ignored for cluster-scoped)
+							ns = ""
+							resourceName = args[2]
+						}
+					}
+				}
+			}
+
+			clientset, err := kube.NewClientset(ctx)
+			if err != nil {
+				return formatErrorWithContext(err, "NewClientset", "", "", "")
+			}
+
+			dynamicClient, err := kube.NewDynamicClient(ctx)
+			if err != nil {
+				return formatErrorWithContext(err, "NewDynamicClient", "", "", "")
+			}
+
+			return clearYMLResource(ctx, clientset, dynamicClient, resourceType, resourceName, ns, cmd.OutOrStdout())
+		},
+	}
+
+	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Namespace (overrides current project)")
+
+	// Register flag completions
+	_ = cmd.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+
+	return cmd
+}
+
+// clearYMLResource fetches and outputs cleaned YAML for resources
+func clearYMLResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType, resourceName, namespace string, out io.Writer) error {
+	// Resolve resource type using discovery
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return formatErrorWithContext(err, "getResourceResolver", resourceType, "", namespace)
+	}
+
+	gvr, namespaced, err := resolver.resolveResource(resourceType)
+	if err != nil {
+		return formatErrorWithContext(err, "resolveResource", resourceType, "", namespace)
+	}
+
+	var obj *unstructured.Unstructured
+	var list *unstructured.UnstructuredList
+
+	if resourceName != "" {
+		// Get single resource
+		obj, err = getSingleResource(ctx, dynamicClient, gvr, resourceName, namespace, namespaced)
+		if err != nil {
+			return formatErrorWithContext(err, "getSingleResource", resourceType, resourceName, namespace)
+		}
+	} else {
+		// List resources
+		if !namespaced {
+			list, err = dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{})
+		} else {
+			if namespace == "" {
+				return fmt.Errorf("namespace is required for namespaced resource %q. Use --namespace or set current project with 'ocp project <namespace>'", resourceType)
+			}
+			list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
+		}
+
+		if meta.IsNoMatchError(err) {
+			return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed", resourceType)
+		}
+		if err != nil {
+			return formatErrorWithContext(err, "listResources", resourceType, "", namespace)
+		}
+
+		if len(list.Items) == 0 {
+			fmt.Fprintf(out, "# No %s found", resourceType)
+			if namespace != "" {
+				fmt.Fprintf(out, " in namespace %q", namespace)
+			}
+			fmt.Fprintf(out, "\n")
+			return nil
+		}
+	}
+
+	// Clean and output YAML
+	if obj != nil {
+		cleaned := cleanUnstructuredObject(obj)
+		return printCleanedYAML(cleaned, out)
+	} else {
+		// Clean each item in the list
+		cleanedItems := make([]*unstructured.Unstructured, 0, len(list.Items))
+		for i := range list.Items {
+			cleaned := cleanUnstructuredObject(&list.Items[i])
+			cleanedItems = append(cleanedItems, cleaned)
+		}
+		return printCleanedYAMLList(cleanedItems, out)
+	}
+}
+
+// cleanUnstructuredObject removes unnecessary fields from a Kubernetes resource
+// This creates a clean YAML suitable for version control or reapplying
+func cleanUnstructuredObject(obj *unstructured.Unstructured) *unstructured.Unstructured {
+	cleaned := obj.DeepCopy()
+
+	// Remove status field (runtime data that shouldn't be in declarative config)
+	delete(cleaned.Object, "status")
+
+	// Clean metadata - remove auto-generated fields
+	if metadata, ok := cleaned.Object["metadata"].(map[string]interface{}); ok {
+		// Remove fields that are auto-generated or not needed for applying
+		delete(metadata, "uid")               // Unique identifier, auto-generated
+		delete(metadata, "resourceVersion")   // Version for optimistic concurrency, auto-generated
+		delete(metadata, "generation")        // Generation counter, auto-generated
+		delete(metadata, "creationTimestamp") // Creation time, auto-generated
+		delete(metadata, "managedFields")     // Server-side apply tracking, auto-generated
+		delete(metadata, "selfLink")          // Deprecated API endpoint, auto-generated
+
+		// Preserve important fields:
+		// - name, namespace (required for identification)
+		// - labels, annotations (user-defined metadata)
+		// - finalizers (important for resource lifecycle)
+		// - ownerReferences (important for garbage collection)
+	}
+
+	// Remove empty/null fields recursively (but preserve empty strings as they might be valid)
+	removeEmptyFields(cleaned.Object)
+
+	return cleaned
+}
+
+// removeEmptyFields recursively removes empty maps, null values, and empty slices
+// Note: We preserve empty strings as they might be valid values in some contexts
+func removeEmptyFields(obj interface{}) {
+	switch v := obj.(type) {
+	case map[string]interface{}:
+		// Collect keys to delete to avoid modifying map during iteration
+		keysToDelete := make([]string, 0)
+		for key, val := range v {
+			switch val := val.(type) {
+			case map[string]interface{}:
+				removeEmptyFields(val)
+				if len(val) == 0 {
+					keysToDelete = append(keysToDelete, key)
+				}
+			case []interface{}:
+				if len(val) == 0 {
+					keysToDelete = append(keysToDelete, key)
+				} else {
+					// Clean items in slice
+					for _, item := range val {
+						removeEmptyFields(item)
+					}
+				}
+			case nil:
+				keysToDelete = append(keysToDelete, key)
+				// Note: We don't remove empty strings as they might be valid values
+				// (e.g., empty imagePullPolicy, empty command, etc.)
+			}
+		}
+		// Delete collected keys
+		for _, key := range keysToDelete {
+			delete(v, key)
+		}
+	case []interface{}:
+		for _, item := range v {
+			removeEmptyFields(item)
+		}
+	}
+}
+
+// printCleanedYAML outputs a single cleaned resource as YAML
+func printCleanedYAML(obj *unstructured.Unstructured, out io.Writer) error {
+	data, err := sigsyaml.Marshal(obj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal YAML: %w", err)
+	}
+	_, err = out.Write(data)
+	return err
+}
+
+// printCleanedYAMLList outputs multiple cleaned resources as YAML with document separators
+func printCleanedYAMLList(items []*unstructured.Unstructured, out io.Writer) error {
+	for i, item := range items {
+		if i > 0 {
+			fmt.Fprintf(out, "---\n")
+		}
+		if err := printCleanedYAML(item, out); err != nil {
+			return err
+		}
+	}
+	return nil
+}

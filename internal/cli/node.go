@@ -173,33 +173,35 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			// Add maintenance annotation if it doesn't exist
+			// Add maintenance annotation if it doesn't exist and cordon in a single update
+			needsUpdate := false
 			if node.Annotations == nil {
 				node.Annotations = make(map[string]string)
 			}
 			if node.Annotations[maintenanceAnnotationKey] != maintenanceAnnotationValue {
 				node.Annotations[maintenanceAnnotationKey] = maintenanceAnnotationValue
+				needsUpdate = true
+			}
+			
+			// Cordon the node
+			if !node.Spec.Unschedulable {
+				node.Spec.Unschedulable = true
+				needsUpdate = true
+			}
+			
+			if needsUpdate {
 				_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 				if err != nil {
-					return fmt.Errorf("failed to add maintenance annotation to node %q: %w", node.Name, err)
+					return fmt.Errorf("failed to update node %q: %w", node.Name, err)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "Added maintenance annotation to node %q\n", node.Name)
+				if node.Annotations[maintenanceAnnotationKey] == maintenanceAnnotationValue {
+					fmt.Fprintf(cmd.OutOrStdout(), "Added maintenance annotation to node %q\n", node.Name)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Node %q marked as unschedulable\n", node.Name)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "Node %q is already unschedulable\n", node.Name)
 			}
-
-			// Get fresh node data after annotation update
-			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
-			}
-
-			// Cordon the node
-			node.Spec.Unschedulable = true
-			_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to cordon node %q: %w", node.Name, err)
-			}
-
-			fmt.Fprintf(cmd.OutOrStdout(), "Node %q marked as unschedulable\n", node.Name)
+			
 			return nil
 		},
 	}
@@ -242,30 +244,30 @@ to control the number of concurrent evictions (default: 5).`,
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
-			// Add maintenance annotation if it doesn't exist
+			// Add maintenance annotation if it doesn't exist and cordon in a single update
+			needsUpdate := false
 			if node.Annotations == nil {
 				node.Annotations = make(map[string]string)
 			}
 			if node.Annotations[maintenanceAnnotationKey] != maintenanceAnnotationValue {
 				node.Annotations[maintenanceAnnotationKey] = maintenanceAnnotationValue
+				needsUpdate = true
+			}
+			
+			// Cordon the node
+			if !node.Spec.Unschedulable {
+				node.Spec.Unschedulable = true
+				needsUpdate = true
+			}
+			
+			if needsUpdate {
 				_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 				if err != nil {
-					return fmt.Errorf("failed to add maintenance annotation to node %q: %w", node.Name, err)
+					return fmt.Errorf("failed to update node %q: %w", node.Name, err)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "Added maintenance annotation to node %q\n", node.Name)
-			}
-
-			// Get fresh node data after annotation update
-			node, err = clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to get node %q: %w", node.Name, err)
-			}
-
-			// Cordon the node
-			node.Spec.Unschedulable = true
-			_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to cordon node %q: %w", node.Name, err)
+				if node.Annotations[maintenanceAnnotationKey] == maintenanceAnnotationValue {
+					fmt.Fprintf(cmd.OutOrStdout(), "Added maintenance annotation to node %q\n", node.Name)
+				}
 			}
 
 			// Evict all pods

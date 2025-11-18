@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -85,6 +86,21 @@ func NewDynamicClient(ctx context.Context) (dynamic.Interface, error) {
 	}
 
 	return dynamic.NewForConfig(cfg)
+}
+
+// NewDiscoveryClient returns a discovery client for API server resource discovery.
+func NewDiscoveryClient(ctx context.Context) (discovery.DiscoveryInterface, error) {
+	cfg, err := restConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return discovery.NewDiscoveryClientForConfig(cfg)
+}
+
+// GetConfig returns the REST config for reuse by other clients.
+func GetConfig(ctx context.Context) (*rest.Config, error) {
+	return restConfig(ctx)
 }
 
 func loadKubeConfig(ctx context.Context) (*rest.Config, error) {

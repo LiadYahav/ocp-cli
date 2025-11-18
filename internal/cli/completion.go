@@ -109,7 +109,8 @@ func completeSchedulableNodes(cmd *cobra.Command, args []string, toComplete stri
 		return nil, cobra.ShellCompDirectiveError
 	}
 
-	completions := make([]string, 0)
+	// Pre-allocate with estimated capacity
+	completions := make([]string, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
 		// Only include schedulable nodes (not cordoned)
 		if !node.Spec.Unschedulable && strings.HasPrefix(node.Name, toComplete) {
@@ -137,7 +138,8 @@ func completeUnschedulableNodes(cmd *cobra.Command, args []string, toComplete st
 		return nil, cobra.ShellCompDirectiveError
 	}
 
-	completions := make([]string, 0)
+	// Pre-allocate with estimated capacity
+	completions := make([]string, 0, len(nodes.Items))
 	for _, node := range nodes.Items {
 		// Only include unschedulable nodes (cordoned)
 		if node.Spec.Unschedulable && strings.HasPrefix(node.Name, toComplete) {

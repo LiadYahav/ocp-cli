@@ -18,11 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	policyv1 "k8s.io/api/policy/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,53 +27,217 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/discovery"
+	discoverycached "k8s.io/client-go/discovery/cached"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/restmapper"
 	sigsyaml "sigs.k8s.io/yaml"
 
 	"github.com/liadyahav/ocp-cli/internal/kube"
 )
 
-// Common Kubernetes resource types
-var commonResources = []string{
-	"pods", "po",
-	"services", "svc",
-	"deployments", "deploy",
-	"replicasets", "rs",
-	"statefulsets", "sts",
-	"daemonsets", "ds",
-	"jobs",
-	"cronjobs", "cj",
-	"configmaps", "cm",
-	"secrets",
-	"persistentvolumeclaims", "pvc",
-	"persistentvolumes", "pv",
-	"nodes", "no",
-	"namespaces", "ns",
-	"ingresses", "ing",
-	"networkpolicies", "netpol",
-	"serviceaccounts", "sa",
-	"rolebindings", "rb",
-	"clusterrolebindings", "crb",
-	"roles",
-	"clusterroles", "cr",
-	"poddisruptionbudgets", "pdb",
-	"machineconfigpools", "mcp",
-	"routes",
-	// OpenShift resources
-	"buildconfigs", "bc",
-	"builds",
-	"deploymentconfigs", "dc",
-	"imagestreams", "is",
-	"imagestreamtags",
-	"imagestreamimages",
-	"templates",
-	"projects", "proj",
-	"clusterresourcequotas", "crq",
-	"securitycontextconstraints", "scc",
-	"networkattachmentdefinitions", "netattdef",
-	"clusteroperators", "co",
-	"clusterversions", "cv",
+// resourceResolver provides dynamic resource discovery and resolution
+type resourceResolver struct {
+	discoveryClient discovery.DiscoveryInterface
+	mapper          meta.RESTMapper
+	resourceCache   map[string]*resourceInfo
+	mu              sync.RWMutex
+}
+
+type resourceInfo struct {
+	gvr           schema.GroupVersionResource
+	namespaced    bool
+	resourceName  string   // singular form
+	resourceNames []string // plural forms and aliases
+}
+
+var (
+	resolverCache = make(map[context.Context]*resourceResolver)
+	resolverMu    sync.Mutex
+)
+
+// getResourceResolver returns a cached resource resolver for the context
+func getResourceResolver(ctx context.Context) (*resourceResolver, error) {
+	resolverMu.Lock()
+	defer resolverMu.Unlock()
+
+	if resolver, ok := resolverCache[ctx]; ok {
+		return resolver, nil
+	}
+
+	discoveryClient, err := kube.NewDiscoveryClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create discovery client: %w", err)
+	}
+
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoverycached.NewMemCacheClient(discoveryClient))
+
+	var resolver *resourceResolver
+	resolver = &resourceResolver{
+		discoveryClient: discoveryClient,
+		mapper:          mapper,
+		resourceCache:   make(map[string]*resourceInfo),
+	}
+
+	// Cache resolver (note: in production, you might want to expire this cache)
+	resolverCache[ctx] = resolver
+
+	return resolver, nil
+}
+
+// discoverResources discovers all available resources from the API server
+func (r *resourceResolver) discoverResources() ([]string, error) {
+	r.mu.RLock()
+	if len(r.resourceCache) > 0 {
+		// Return cached resource names
+		resources := make([]string, 0, len(r.resourceCache)*2) // Estimate: plural + aliases
+		for _, info := range r.resourceCache {
+			resources = append(resources, info.resourceNames...)
+		}
+		r.mu.RUnlock()
+		return resources, nil
+	}
+	r.mu.RUnlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if len(r.resourceCache) > 0 {
+		resources := make([]string, 0, len(r.resourceCache)*2)
+		for _, info := range r.resourceCache {
+			resources = append(resources, info.resourceNames...)
+		}
+		return resources, nil
+	}
+
+	// Discover all API resources
+	_, apiResourceLists, err := r.discoveryClient.ServerGroupsAndResources()
+	if err != nil {
+		// If discovery fails, return empty list but don't fail completely
+		// Some clusters may have partial discovery failures
+		return []string{}, nil
+	}
+
+	resourceMap := make(map[string]*resourceInfo)
+
+	for _, apiResourceList := range apiResourceLists {
+		gv, err := schema.ParseGroupVersion(apiResourceList.GroupVersion)
+		if err != nil {
+			continue
+		}
+
+		for _, apiResource := range apiResourceList.APIResources {
+			// Skip subresources (e.g., pods/status, pods/exec)
+			if strings.Contains(apiResource.Name, "/") {
+				continue
+			}
+
+			// Skip non-verb resources
+			if !contains(apiResource.Verbs, "get") && !contains(apiResource.Verbs, "list") {
+				continue
+			}
+
+			gvr := schema.GroupVersionResource{
+				Group:    gv.Group,
+				Version:  gv.Version,
+				Resource: apiResource.Name,
+			}
+
+			// Use plural name as primary key
+			pluralName := apiResource.Name
+			resourceNames := []string{pluralName}
+
+			// Add singular name if different
+			if apiResource.SingularName != "" && apiResource.SingularName != pluralName {
+				resourceNames = append(resourceNames, apiResource.SingularName)
+			}
+
+			// Add short names if available
+			for _, shortName := range apiResource.ShortNames {
+				resourceNames = append(resourceNames, shortName)
+			}
+
+			// Store or merge with existing entry
+			if existing, exists := resourceMap[pluralName]; exists {
+				// Merge resource names
+				existing.resourceNames = append(existing.resourceNames, resourceNames...)
+			} else {
+				resourceMap[pluralName] = &resourceInfo{
+					gvr:           gvr,
+					namespaced:    apiResource.Namespaced,
+					resourceName:  apiResource.SingularName,
+					resourceNames: resourceNames,
+				}
+			}
+		}
+	}
+
+	// Update cache
+	r.resourceCache = resourceMap
+
+	// Build resource list for completion
+	resources := make([]string, 0, len(resourceMap)*2)
+	for _, info := range resourceMap {
+		resources = append(resources, info.resourceNames...)
+	}
+
+	return resources, nil
+}
+
+// resolveResource resolves a resource type (including aliases) to its GVR and scope
+func (r *resourceResolver) resolveResource(resourceType string) (schema.GroupVersionResource, bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Search cache for matching resource
+	for _, info := range r.resourceCache {
+		for _, name := range info.resourceNames {
+			if strings.EqualFold(name, resourceType) {
+				return info.gvr, info.namespaced, nil
+			}
+		}
+	}
+
+	// Try using REST mapper as fallback
+	gvr, err := r.mapper.ResourceFor(schema.GroupVersionResource{Resource: resourceType})
+	if err == nil {
+		// Determine if namespaced by checking the mapper
+		mapping, err := r.mapper.RESTMapping(schema.GroupKind{Group: gvr.Group, Kind: ""}, gvr.Version)
+		if err == nil {
+			return gvr, mapping.Scope.Name() == meta.RESTScopeNameNamespace, nil
+		}
+		return gvr, true, nil // Default to namespaced if we can't determine
+	}
+
+	return schema.GroupVersionResource{}, false, fmt.Errorf("resource type %q not found in cluster", resourceType)
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// completeResourceTypes returns discovered resource types for completion
+func completeResourceTypes(cmd *cobra.Command, toComplete string) ([]string, cobra.ShellCompDirective) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+	resources, err := resolver.discoverResources()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+	return filterCompletions(resources, toComplete), cobra.ShellCompDirectiveNoFileComp
 }
 
 // Commands are exported individually to be added directly to root
@@ -93,6 +253,14 @@ func newGetCommand() *cobra.Command {
 		Use:   "get <resource-type> [resource-name]",
 		Short: "Display one or many resources",
 		Long: `Display one or many resources.
+
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources (pods, services, deployments, etc.)
+- OpenShift resources (routes, buildconfigs, deploymentconfigs, etc.)
+- Custom Resource Definitions (CRDs) installed in your cluster
+
+Resource types are automatically discovered from the API server, so you can use
+any resource type without hardcoding.
 
 Examples:
   # List all pods
@@ -111,11 +279,29 @@ Examples:
   ocp get pods -owide
 
   # Show pods with labels
-  ocp get pods --show-labels`,
+  ocp get pods --show-labels
+
+  # List any custom resource (CRD)
+  ocp get mycustomresources
+
+  # Get a specific custom resource
+  ocp get mycustomresource my-instance`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
-				// Complete resource types
-				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+				// Complete resource types using discovery
+				ctx := cmd.Context()
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				resolver, err := getResourceResolver(ctx)
+				if err != nil {
+					return nil, cobra.ShellCompDirectiveError
+				}
+				resources, err := resolver.discoverResources()
+				if err != nil {
+					return nil, cobra.ShellCompDirectiveError
+				}
+				return filterCompletions(resources, toComplete), cobra.ShellCompDirectiveNoFileComp
 			}
 			if len(args) == 1 {
 				// Complete resource names for the given type
@@ -148,26 +334,17 @@ Examples:
   # Output as YAML
   ocp get pods -o yaml
 
-  # List Machine Config Pools (OpenShift)
+  # List any OpenShift resource (automatically discovered)
+  ocp get routes
+  ocp get buildconfigs
+  ocp get deploymentconfigs
+  ocp get imagestreams
+  ocp get clusteroperators
   ocp get mcp
 
-  # Get a specific Machine Config Pool
-  ocp get mcp worker
-
-  # List Routes (OpenShift)
-  ocp get routes
-
-  # List BuildConfigs (OpenShift)
-  ocp get buildconfigs
-
-  # List DeploymentConfigs (OpenShift)
-  ocp get deploymentconfigs
-
-  # List ImageStreams (OpenShift)
-  ocp get imagestreams
-
-  # List ClusterOperators (OpenShift)
-  ocp get clusteroperators`,
+  # List any custom resource (CRD) - automatically discovered
+  ocp get mycustomresources
+  ocp get mycustomresource my-instance`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -213,12 +390,30 @@ func newCreateCommand() *cobra.Command {
 		Short: "Create a resource from a file",
 		Long: `Create a resource from a file or stdin.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
+Resources are created using the dynamic client, so any valid Kubernetes resource
+definition will work.
+
 Examples:
   # Create from a file
   ocp create -f deployment.yaml
 
   # Create from stdin
-  cat deployment.yaml | ocp create -f -`,
+  cat deployment.yaml | ocp create -f -
+
+  # Create multiple resources from multiple files
+  ocp create -f file1.yaml -f file2.yaml
+
+  # Create any OpenShift resource
+  ocp create -f route.yaml
+  ocp create -f buildconfig.yaml
+
+  # Create any custom resource (CRD)
+  ocp create -f mycustomresource.yaml`,
 		Args: cobra.NoArgs,
 		Example: `  # Create resources from a file
   ocp create -f deployment.yaml
@@ -229,9 +424,12 @@ Examples:
   # Create from stdin
   cat route.yaml | ocp create -f -
 
-  # Create OpenShift resources
+  # Create OpenShift resources (automatically discovered)
   ocp create -f route.yaml
-  ocp create -f buildconfig.yaml`,
+  ocp create -f buildconfig.yaml
+
+  # Create any custom resource (CRD)
+  ocp create -f mycustomresource.yaml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -291,15 +489,26 @@ func newEditCommand() *cobra.Command {
 
 The editor is determined by the EDITOR environment variable, or defaults to vi.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
 Examples:
   # Edit a deployment
   ocp edit deployment my-app
 
   # Edit a pod
-  ocp edit pod my-pod`,
+  ocp edit pod my-pod
+
+  # Edit any OpenShift resource
+  ocp edit route my-route
+
+  # Edit any custom resource (CRD)
+  ocp edit mycustomresource my-instance`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
-				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+				return completeResourceTypes(cmd, toComplete)
 			}
 			if len(args) == 1 {
 				return completeResourceNames(cmd, args[0], toComplete, namespace, false)
@@ -362,6 +571,13 @@ func newDeleteCommand() *cobra.Command {
 		Short: "Delete resources",
 		Long: `Delete resources by resource type and name, or by selector.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
+Deletion operations on multiple resources are performed concurrently for better performance.
+
 Examples:
   # Delete a pod
   ocp delete pod my-pod
@@ -369,11 +585,14 @@ Examples:
   # Delete all pods matching a selector
   ocp delete pods -l app=myapp
 
-  # Delete multiple resources
-  ocp delete pod pod1 pod2 pod3`,
+  # Delete multiple resources (concurrent)
+  ocp delete pod pod1 pod2 pod3
+
+  # Delete any custom resource (CRD)
+  ocp delete mycustomresource my-instance`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
-				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+				return completeResourceTypes(cmd, toComplete)
 			}
 			if len(args) == 1 {
 				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
@@ -446,15 +665,26 @@ func newDescribeCommand() *cobra.Command {
 		Short: "Show details of a specific resource",
 		Long: `Show details of a specific resource or group of resources.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
 Examples:
   # Describe a pod
   ocp describe pod my-pod
 
   # Describe a deployment
-  ocp describe deployment my-app`,
+  ocp describe deployment my-app
+
+  # Describe any OpenShift resource
+  ocp describe route my-route
+
+  # Describe any custom resource (CRD)
+  ocp describe mycustomresource my-instance`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
-				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+				return completeResourceTypes(cmd, toComplete)
 			}
 			if len(args) == 1 {
 				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
@@ -598,12 +828,27 @@ func newApplyCommand() *cobra.Command {
 		Short: "Apply a configuration to a resource",
 		Long: `Apply a configuration to a resource by filename or stdin.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
+Resources are applied using the dynamic client, so any valid Kubernetes resource
+definition will work. The command creates resources if they don't exist, or updates
+them if they do.
+
 Examples:
   # Apply from a file
   ocp apply -f deployment.yaml
 
   # Apply from stdin
-  cat deployment.yaml | ocp apply -f -`,
+  cat deployment.yaml | ocp apply -f -
+
+  # Apply any OpenShift resource
+  ocp apply -f route.yaml
+
+  # Apply any custom resource (CRD)
+  ocp apply -f mycustomresource.yaml`,
 		Args: cobra.NoArgs,
 		Example: `  # Apply resources from a file
   ocp apply -f deployment.yaml
@@ -681,15 +926,26 @@ func newPatchCommand() *cobra.Command {
 		Short: "Update field(s) of a resource",
 		Long: `Update field(s) of a resource using strategic merge patch, JSON merge patch, or JSON patch.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
 Examples:
   # Patch using JSON
   ocp patch pod my-pod -p '{"spec":{"containers":[{"name":"my-container","image":"new-image"}]}}'
 
   # Patch from a file
-  ocp patch pod my-pod --patch-file patch.yaml`,
+  ocp patch pod my-pod --patch-file patch.yaml
+
+  # Patch any OpenShift resource
+  ocp patch route my-route -p '{"spec":{"host":"new-host.example.com"}}'
+
+  # Patch any custom resource (CRD)
+  ocp patch mycustomresource my-instance -p '{"spec":{"replicas":3}}'`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
-				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+				return completeResourceTypes(cmd, toComplete)
 			}
 			if len(args) == 1 {
 				return completeResourceNames(cmd, args[0], toComplete, namespace, false)
@@ -788,9 +1044,7 @@ func completeResourceNames(cmd *cobra.Command, resourceType string, toComplete s
 
 	ns := resolveNamespace(ctx, namespace, allNamespaces)
 
-	// Normalize resource type (handle aliases)
-	resourceType = normalizeResourceType(resourceType)
-
+	// Resource type resolution is handled by listResourceNames using discovery
 	names, err := listResourceNames(ctx, clientset, resourceType, ns, allNamespaces)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
@@ -827,45 +1081,40 @@ func completePodNames(cmd *cobra.Command, toComplete string, namespace string) (
 	return names, cobra.ShellCompDirectiveNoFileComp
 }
 
-func normalizeResourceType(resourceType string) string {
-	// Handle common aliases
-	aliasMap := map[string]string{
-		"po":     "pods",
-		"svc":    "services",
-		"deploy": "deployments",
-		"rs":     "replicasets",
-		"sts":    "statefulsets",
-		"ds":     "daemonsets",
-		"cj":     "cronjobs",
-		"cm":     "configmaps",
-		"pvc":    "persistentvolumeclaims",
-		"pv":     "persistentvolumes",
-		"no":     "nodes",
-		"ns":     "namespaces",
-		"ing":    "ingresses",
-		"netpol": "networkpolicies",
-		"sa":     "serviceaccounts",
-		"rb":     "rolebindings",
-		"crb":    "clusterrolebindings",
-		"cr":     "clusterroles",
-		"pdb":    "poddisruptionbudgets",
-		"mcp":    "machineconfigpools",
-		"route":  "routes",
-		// OpenShift aliases
-		"bc":        "buildconfigs",
-		"dc":        "deploymentconfigs",
-		"is":        "imagestreams",
-		"proj":      "projects",
-		"crq":       "clusterresourcequotas",
-		"scc":       "securitycontextconstraints",
-		"netattdef": "networkattachmentdefinitions",
-		"co":        "clusteroperators",
-		"cv":        "clusterversions",
+// normalizeResourceType is now a wrapper that uses discovery-based resolution
+// It returns the resource type string (for backward compatibility with existing code)
+// but internally uses discovery to resolve aliases
+// Note: This function now requires context. For backward compatibility, it returns the resource type as-is if discovery fails.
+func normalizeResourceType(ctx context.Context, resourceType string) string {
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		// If discovery fails, return as-is (backward compatibility)
+		return resourceType
 	}
 
-	if normalized, ok := aliasMap[resourceType]; ok {
-		return normalized
+	// Resolve to get the canonical resource name
+	_, _, err = resolver.resolveResource(resourceType)
+	if err != nil {
+		// If resolution fails, return as-is
+		return resourceType
 	}
+
+	// Find the primary (plural) name from cache
+	resolver.mu.RLock()
+	defer resolver.mu.RUnlock()
+
+	for _, info := range resolver.resourceCache {
+		for _, name := range info.resourceNames {
+			if strings.EqualFold(name, resourceType) {
+				// Return the plural form (first in resourceNames)
+				if len(info.resourceNames) > 0 {
+					return info.resourceNames[0]
+				}
+			}
+		}
+	}
+
+	// If not found in cache, return as-is (discovery will handle it)
 	return resourceType
 }
 
@@ -914,434 +1163,52 @@ func isClusterScopedResource(resourceType string) bool {
 	return clusterScoped[resourceType]
 }
 
+// listResourceNames lists resource names using discovery and dynamic client (fully generic)
 func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, namespace string, allNamespaces bool) ([]string, error) {
-	names := make([]string, 0)
+	// Resolve resource type to GVR using discovery
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get resource resolver: %w", err)
+	}
 
-	switch resourceType {
-	case "pods", "po":
-		var pods *corev1.PodList
-		var err error
+	gvr, namespaced, err := resolver.resolveResource(resourceType)
+	if err != nil {
+		return nil, fmt.Errorf("resource type %q not found: %w", resourceType, err)
+	}
+
+	// Use dynamic client for all resources (fully generic)
+	dynamicClient, err := kube.NewDynamicClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	var list *unstructured.UnstructuredList
+	if !namespaced {
+		// Cluster-scoped resource
+		list, err = dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{})
+	} else {
+		// Namespace-scoped resource
 		if allNamespaces {
-			pods, err = clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+			list, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, metav1.ListOptions{})
 		} else {
-			pods, err = clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+			list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
 		}
-		if err != nil {
-			return nil, err
-		}
-		for _, pod := range pods.Items {
-			names = append(names, pod.Name)
-		}
+	}
 
-	case "services", "svc":
-		var svcs *corev1.ServiceList
-		var err error
-		if allNamespaces {
-			svcs, err = clientset.CoreV1().Services("").List(ctx, metav1.ListOptions{})
-		} else {
-			svcs, err = clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, svc := range svcs.Items {
-			names = append(names, svc.Name)
-		}
+	if meta.IsNoMatchError(err) {
+		// CRD not available - return empty list for completion
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to list resources: %w", err)
+	}
 
-	case "deployments", "deploy":
-		var deploys *appsv1.DeploymentList
-		var err error
-		if allNamespaces {
-			deploys, err = clientset.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
-		} else {
-			deploys, err = clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	names := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		name, found, _ := unstructured.NestedString(item.Object, "metadata", "name")
+		if found && name != "" {
+			names = append(names, name)
 		}
-		if err != nil {
-			return nil, err
-		}
-		for _, deploy := range deploys.Items {
-			names = append(names, deploy.Name)
-		}
-
-	case "replicasets", "rs":
-		var rs *appsv1.ReplicaSetList
-		var err error
-		if allNamespaces {
-			rs, err = clientset.AppsV1().ReplicaSets("").List(ctx, metav1.ListOptions{})
-		} else {
-			rs, err = clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range rs.Items {
-			names = append(names, r.Name)
-		}
-
-	case "statefulsets", "sts":
-		var sts *appsv1.StatefulSetList
-		var err error
-		if allNamespaces {
-			sts, err = clientset.AppsV1().StatefulSets("").List(ctx, metav1.ListOptions{})
-		} else {
-			sts, err = clientset.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, s := range sts.Items {
-			names = append(names, s.Name)
-		}
-
-	case "daemonsets", "ds":
-		var ds *appsv1.DaemonSetList
-		var err error
-		if allNamespaces {
-			ds, err = clientset.AppsV1().DaemonSets("").List(ctx, metav1.ListOptions{})
-		} else {
-			ds, err = clientset.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, d := range ds.Items {
-			names = append(names, d.Name)
-		}
-
-	case "jobs":
-		var jobs *batchv1.JobList
-		var err error
-		if allNamespaces {
-			jobs, err = clientset.BatchV1().Jobs("").List(ctx, metav1.ListOptions{})
-		} else {
-			jobs, err = clientset.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, job := range jobs.Items {
-			names = append(names, job.Name)
-		}
-
-	case "cronjobs", "cj":
-		var cjs *batchv1.CronJobList
-		var err error
-		if allNamespaces {
-			cjs, err = clientset.BatchV1().CronJobs("").List(ctx, metav1.ListOptions{})
-		} else {
-			cjs, err = clientset.BatchV1().CronJobs(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, cj := range cjs.Items {
-			names = append(names, cj.Name)
-		}
-
-	case "configmaps", "cm":
-		var cms *corev1.ConfigMapList
-		var err error
-		if allNamespaces {
-			cms, err = clientset.CoreV1().ConfigMaps("").List(ctx, metav1.ListOptions{})
-		} else {
-			cms, err = clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, cm := range cms.Items {
-			names = append(names, cm.Name)
-		}
-
-	case "secrets":
-		var secrets *corev1.SecretList
-		var err error
-		if allNamespaces {
-			secrets, err = clientset.CoreV1().Secrets("").List(ctx, metav1.ListOptions{})
-		} else {
-			secrets, err = clientset.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, secret := range secrets.Items {
-			names = append(names, secret.Name)
-		}
-
-	case "persistentvolumeclaims", "pvc":
-		var pvcs *corev1.PersistentVolumeClaimList
-		var err error
-		if allNamespaces {
-			pvcs, err = clientset.CoreV1().PersistentVolumeClaims("").List(ctx, metav1.ListOptions{})
-		} else {
-			pvcs, err = clientset.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, pvc := range pvcs.Items {
-			names = append(names, pvc.Name)
-		}
-
-	case "persistentvolumes", "pv":
-		pvs, err := clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-		for _, pv := range pvs.Items {
-			names = append(names, pv.Name)
-		}
-
-	case "nodes", "no":
-		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-		for _, node := range nodes.Items {
-			names = append(names, node.Name)
-		}
-
-	case "namespaces", "ns":
-		nss, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-		for _, ns := range nss.Items {
-			names = append(names, ns.Name)
-		}
-
-	case "ingresses", "ing":
-		var ings *networkingv1.IngressList
-		var err error
-		if allNamespaces {
-			ings, err = clientset.NetworkingV1().Ingresses("").List(ctx, metav1.ListOptions{})
-		} else {
-			ings, err = clientset.NetworkingV1().Ingresses(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, ing := range ings.Items {
-			names = append(names, ing.Name)
-		}
-
-	case "networkpolicies", "netpol":
-		var netpols *networkingv1.NetworkPolicyList
-		var err error
-		if allNamespaces {
-			netpols, err = clientset.NetworkingV1().NetworkPolicies("").List(ctx, metav1.ListOptions{})
-		} else {
-			netpols, err = clientset.NetworkingV1().NetworkPolicies(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, np := range netpols.Items {
-			names = append(names, np.Name)
-		}
-
-	case "serviceaccounts", "sa":
-		var sas *corev1.ServiceAccountList
-		var err error
-		if allNamespaces {
-			sas, err = clientset.CoreV1().ServiceAccounts("").List(ctx, metav1.ListOptions{})
-		} else {
-			sas, err = clientset.CoreV1().ServiceAccounts(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, sa := range sas.Items {
-			names = append(names, sa.Name)
-		}
-
-	case "rolebindings", "rb":
-		var rbs *rbacv1.RoleBindingList
-		var err error
-		if allNamespaces {
-			// RoleBindings are namespace-scoped, need to list all namespaces
-			nss, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			for _, ns := range nss.Items {
-				rbs, err := clientset.RbacV1().RoleBindings(ns.Name).List(ctx, metav1.ListOptions{})
-				if err != nil {
-					continue
-				}
-				for _, rb := range rbs.Items {
-					names = append(names, rb.Name)
-				}
-			}
-		} else {
-			rbs, err = clientset.RbacV1().RoleBindings(namespace).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			for _, rb := range rbs.Items {
-				names = append(names, rb.Name)
-			}
-		}
-
-	case "clusterrolebindings", "crb":
-		crbs, err := clientset.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-		for _, crb := range crbs.Items {
-			names = append(names, crb.Name)
-		}
-
-	case "roles":
-		var roles *rbacv1.RoleList
-		var err error
-		if allNamespaces {
-			nss, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			for _, ns := range nss.Items {
-				roles, err := clientset.RbacV1().Roles(ns.Name).List(ctx, metav1.ListOptions{})
-				if err != nil {
-					continue
-				}
-				for _, role := range roles.Items {
-					names = append(names, role.Name)
-				}
-			}
-		} else {
-			roles, err = clientset.RbacV1().Roles(namespace).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			for _, role := range roles.Items {
-				names = append(names, role.Name)
-			}
-		}
-
-	case "clusterroles", "cr":
-		crs, err := clientset.RbacV1().ClusterRoles().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-		for _, cr := range crs.Items {
-			names = append(names, cr.Name)
-		}
-
-	case "poddisruptionbudgets", "pdb":
-		var pdbs *policyv1.PodDisruptionBudgetList
-		var err error
-		if allNamespaces {
-			pdbs, err = clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
-		} else {
-			pdbs, err = clientset.PolicyV1().PodDisruptionBudgets(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if err != nil {
-			return nil, err
-		}
-		for _, pdb := range pdbs.Items {
-			names = append(names, pdb.Name)
-		}
-
-	case "machineconfigpools", "mcp":
-		dynamicClient, err := kube.NewDynamicClient(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create dynamic client: %w", err)
-		}
-
-		gvr := schema.GroupVersionResource{
-			Group:    "machineconfiguration.openshift.io",
-			Version:  "v1",
-			Resource: "machineconfigpools",
-		}
-
-		mcpList, err := dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{})
-		if meta.IsNoMatchError(err) {
-			// API not available, return empty list
-			return []string{}, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		for _, mcp := range mcpList.Items {
-			name, found, _ := unstructured.NestedString(mcp.Object, "metadata", "name")
-			if found && name != "" {
-				names = append(names, name)
-			}
-		}
-
-	case "routes", "route":
-		dynamicClient, err := kube.NewDynamicClient(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create dynamic client: %w", err)
-		}
-
-		gvr := schema.GroupVersionResource{
-			Group:    "route.openshift.io",
-			Version:  "v1",
-			Resource: "routes",
-		}
-
-		var routeList *unstructured.UnstructuredList
-		if allNamespaces {
-			routeList, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, metav1.ListOptions{})
-		} else {
-			routeList, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
-		}
-		if meta.IsNoMatchError(err) {
-			// API not available, return empty list
-			return []string{}, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		for _, route := range routeList.Items {
-			name, found, _ := unstructured.NestedString(route.Object, "metadata", "name")
-			if found && name != "" {
-				names = append(names, name)
-			}
-		}
-
-	default:
-		// Try OpenShift resources
-		gvr := getOpenShiftGVR(resourceType)
-		if gvr != nil {
-			dynamicClient, err := kube.NewDynamicClient(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create dynamic client: %w", err)
-			}
-
-			var list *unstructured.UnstructuredList
-			if isClusterScopedResource(resourceType) {
-				list, err = dynamicClient.Resource(*gvr).List(ctx, metav1.ListOptions{})
-			} else {
-				if allNamespaces {
-					list, err = dynamicClient.Resource(*gvr).Namespace("").List(ctx, metav1.ListOptions{})
-				} else {
-					list, err = dynamicClient.Resource(*gvr).Namespace(namespace).List(ctx, metav1.ListOptions{})
-				}
-			}
-
-			if meta.IsNoMatchError(err) {
-				// CRD not available - return empty list for completion, but this will be caught in getResource
-				return []string{}, nil
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			for _, item := range list.Items {
-				name, found, _ := unstructured.NestedString(item.Object, "metadata", "name")
-				if found && name != "" {
-					names = append(names, name)
-				}
-			}
-			return names, nil
-		}
-
-		return nil, fmt.Errorf("unsupported resource type: %s", resourceType)
 	}
 
 	return names, nil
@@ -1350,270 +1217,95 @@ func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, res
 // Implementation functions
 
 func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, resourceName string, namespace string, allNamespaces bool, selector string, output string, showLabels bool, out io.Writer) error {
-	resourceType = normalizeResourceType(resourceType)
+	// Use discovery to resolve resource type
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get resource resolver: %w", err)
+	}
+
+	gvr, namespaced, err := resolver.resolveResource(resourceType)
+	if err != nil {
+		return fmt.Errorf("resource type %q not found: %w", resourceType, err)
+	}
+
+	// Use dynamic client for all resources (fully generic)
+	dynamicClient, err := kube.NewDynamicClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
 	opts := metav1.ListOptions{}
 	if selector != "" {
 		opts.LabelSelector = selector
 	}
 
-	var err error
-	switch resourceType {
-	case "pods", "po":
-		var pods *corev1.PodList
-		if resourceName != "" {
-			var pod *corev1.Pod
-			if allNamespaces {
-				pod, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			} else {
-				pod, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			}
-			if err != nil {
-				return err
-			}
-			return printResource(pod, output, out)
-		}
+	var list *unstructured.UnstructuredList
+	if !namespaced {
+		// Cluster-scoped resource
+		list, err = dynamicClient.Resource(gvr).List(ctx, opts)
+	} else {
+		// Namespace-scoped resource
 		if allNamespaces {
-			pods, err = clientset.CoreV1().Pods("").List(ctx, opts)
+			list, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, opts)
 		} else {
-			pods, err = clientset.CoreV1().Pods(namespace).List(ctx, opts)
+			list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, opts)
 		}
-		if err != nil {
-			return err
-		}
-		return printResourceList(pods, output, out, allNamespaces, showLabels, resourceType)
-
-	case "services", "svc":
-		var svcs *corev1.ServiceList
-		if resourceName != "" {
-			var svc *corev1.Service
-			if allNamespaces {
-				svc, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			} else {
-				svc, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			}
-			if err != nil {
-				return err
-			}
-			return printResource(svc, output, out)
-		}
-		if allNamespaces {
-			svcs, err = clientset.CoreV1().Services("").List(ctx, opts)
-		} else {
-			svcs, err = clientset.CoreV1().Services(namespace).List(ctx, opts)
-		}
-		if err != nil {
-			return err
-		}
-		return printResourceList(svcs, output, out, allNamespaces, showLabels, resourceType)
-
-	case "deployments", "deploy":
-		var deploys *appsv1.DeploymentList
-		if resourceName != "" {
-			var deploy *appsv1.Deployment
-			if allNamespaces {
-				deploy, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			} else {
-				deploy, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			}
-			if err != nil {
-				return err
-			}
-			return printResource(deploy, output, out)
-		}
-		if allNamespaces {
-			deploys, err = clientset.AppsV1().Deployments("").List(ctx, opts)
-		} else {
-			deploys, err = clientset.AppsV1().Deployments(namespace).List(ctx, opts)
-		}
-		if err != nil {
-			return err
-		}
-		return printResourceList(deploys, output, out, allNamespaces, showLabels, resourceType)
-
-	case "nodes", "no":
-		if resourceName != "" {
-			node, err := clientset.CoreV1().Nodes().Get(ctx, resourceName, metav1.GetOptions{})
-			if err != nil {
-				return err
-			}
-			return printResource(node, output, out)
-		}
-		nodes, err := clientset.CoreV1().Nodes().List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		return printResourceList(nodes, output, out, false, showLabels, resourceType)
-
-	case "namespaces", "ns":
-		if resourceName != "" {
-			ns, err := clientset.CoreV1().Namespaces().Get(ctx, resourceName, metav1.GetOptions{})
-			if err != nil {
-				return err
-			}
-			return printResource(ns, output, out)
-		}
-		nss, err := clientset.CoreV1().Namespaces().List(ctx, opts)
-		if err != nil {
-			return err
-		}
-		return printResourceList(nss, output, out, false, showLabels, resourceType)
-
-	case "machineconfigpools", "mcp":
-		dynamicClient, err := kube.NewDynamicClient(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to create dynamic client: %w", err)
-		}
-
-		gvr := schema.GroupVersionResource{
-			Group:    "machineconfiguration.openshift.io",
-			Version:  "v1",
-			Resource: "machineconfigpools",
-		}
-
-		if resourceName != "" {
-			mcp, err := dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
-			if meta.IsNoMatchError(err) {
-				return fmt.Errorf("machine config pool API not available - ensure you're connected to an OpenShift cluster")
-			}
-			if err != nil {
-				return err
-			}
-			return printResource(mcp, output, out)
-		}
-
-		mcpList, err := dynamicClient.Resource(gvr).List(ctx, opts)
-		if meta.IsNoMatchError(err) {
-			return fmt.Errorf("machine config pool API not available - ensure you're connected to an OpenShift cluster")
-		}
-		if err != nil {
-			return err
-		}
-
-		// Convert unstructured list to runtime.Object list for printResourceList
-		items, err := meta.ExtractList(mcpList)
-		if err != nil {
-			return err
-		}
-
-		if output == "json" || output == "yaml" || output == "name" {
-			return printResourceList(mcpList, output, out, false, showLabels, resourceType)
-		}
-
-		// Use custom table format for MCP
-		return printMCPTable(items, out, showLabels, false)
-
-	case "routes", "route":
-		dynamicClient, err := kube.NewDynamicClient(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to create dynamic client: %w", err)
-		}
-
-		gvr := schema.GroupVersionResource{
-			Group:    "route.openshift.io",
-			Version:  "v1",
-			Resource: "routes",
-		}
-
-		if resourceName != "" {
-			route, err := dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			if meta.IsNoMatchError(err) {
-				return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
-			}
-			if err != nil {
-				return err
-			}
-			return printResource(route, output, out)
-		}
-
-		var routeList *unstructured.UnstructuredList
-		if allNamespaces {
-			routeList, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, opts)
-		} else {
-			routeList, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, opts)
-		}
-		if meta.IsNoMatchError(err) {
-			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
-		}
-		if err != nil {
-			return err
-		}
-
-		// Convert unstructured list to runtime.Object list for printResourceList
-		items, err := meta.ExtractList(routeList)
-		if err != nil {
-			return err
-		}
-
-		if output == "json" || output == "yaml" || output == "name" {
-			return printResourceList(routeList, output, out, allNamespaces, showLabels, resourceType)
-		}
-
-		// Use custom table format for Routes
-		return printRoutesTable(items, out, showLabels, allNamespaces, output == "wide")
-
-	default:
-		// Try OpenShift resources
-		gvr := getOpenShiftGVR(resourceType)
-		if gvr != nil {
-			dynamicClient, err := kube.NewDynamicClient(ctx)
-			if err != nil {
-				return fmt.Errorf("failed to create dynamic client: %w", err)
-			}
-
-			if resourceName != "" {
-				// Get single resource
-				var obj *unstructured.Unstructured
-				if isClusterScopedResource(resourceType) {
-					obj, err = dynamicClient.Resource(*gvr).Get(ctx, resourceName, metav1.GetOptions{})
-				} else {
-					obj, err = dynamicClient.Resource(*gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-				}
-
-				if meta.IsNoMatchError(err) {
-					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-				}
-				if err != nil {
-					return err
-				}
-				return printResource(obj, output, out)
-			}
-
-			// List resources
-			var list *unstructured.UnstructuredList
-			if isClusterScopedResource(resourceType) {
-				list, err = dynamicClient.Resource(*gvr).List(ctx, opts)
-			} else {
-				if allNamespaces {
-					list, err = dynamicClient.Resource(*gvr).Namespace("").List(ctx, opts)
-				} else {
-					list, err = dynamicClient.Resource(*gvr).Namespace(namespace).List(ctx, opts)
-				}
-			}
-
-			if meta.IsNoMatchError(err) {
-				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-			}
-			if err != nil {
-				return err
-			}
-
-			// Convert unstructured list to runtime.Object list for printResourceList
-			items, err := meta.ExtractList(list)
-			if err != nil {
-				return err
-			}
-
-			if output == "json" || output == "yaml" || output == "name" {
-				return printResourceList(list, output, out, allNamespaces, showLabels, resourceType)
-			}
-
-			// Use default table format for OpenShift resources
-			return printSimpleTable(items, out, allNamespaces, showLabels)
-		}
-
-		return fmt.Errorf("resource type %q not yet implemented for get command", resourceType)
 	}
+
+	if meta.IsNoMatchError(err) {
+		return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed", resourceType)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to list resources: %w", err)
+	}
+
+	// If resourceName specified, filter to that resource
+	if resourceName != "" {
+		found := false
+		for _, item := range list.Items {
+			name, _, _ := unstructured.NestedString(item.Object, "metadata", "name")
+			if name == resourceName {
+				return printResource(&item, output, out)
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s %q not found", resourceType, resourceName)
+		}
+	}
+
+	// Print list
+	return printResourceList(list, output, out, allNamespaces, showLabels, resourceType)
 }
+
+// Helper function to get a single resource by name using discovery
+func getSingleResource(ctx context.Context, dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, resourceName string, namespace string, namespaced bool) (*unstructured.Unstructured, error) {
+	var obj *unstructured.Unstructured
+	var err error
+
+	if !namespaced {
+		obj, err = dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
+	} else {
+		if namespace == "" {
+			return nil, fmt.Errorf("namespace is required for namespaced resource")
+		}
+		obj, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	}
+
+	if meta.IsNoMatchError(err) {
+		return nil, fmt.Errorf("resource type is not available in this cluster - the Custom Resource Definition (CRD) may not be installed")
+	}
+	if apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("resource %q not found", resourceName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get resource: %w", err)
+	}
+
+	return obj, nil
+}
+
+// Implementation functions - All functions now use discovery-based generic resource handling
+// All hardcoded switch statements have been replaced with generic discovery-based implementations
 
 func printResource(obj runtime.Object, output string, out io.Writer) error {
 	switch output {
@@ -1629,11 +1321,11 @@ func printResource(obj runtime.Object, output string, out io.Writer) error {
 		_, err = out.Write(data)
 		return err
 	case "name":
-		meta, err := meta.Accessor(obj)
+		metaObj, err := meta.Accessor(obj)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "%s\n", meta.GetName())
+		fmt.Fprintf(out, "%s\n", metaObj.GetName())
 		return nil
 	default:
 		// Default table format
@@ -1645,6 +1337,10 @@ func printResource(obj runtime.Object, output string, out io.Writer) error {
 		return err
 	}
 }
+
+// createResources is defined later in the file (around line 3205)
+
+// printResourceList is defined later in the file (around line 1725)
 
 func printResourceList(list runtime.Object, output string, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
 	switch output {
@@ -3187,37 +2883,36 @@ func createResources(ctx context.Context, clientset *kubernetes.Clientset, dynam
 }
 
 func editResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
-	resourceType = normalizeResourceType(resourceType)
-
-	// Get the resource
-	var obj runtime.Object
-	var err error
-
-	switch resourceType {
-	case "pods", "po":
-		obj, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-	case "services", "svc":
-		obj, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-	case "deployments", "deploy":
-		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-	default:
-		// Try OpenShift resources
-		gvr := getOpenShiftGVR(resourceType)
-		if gvr != nil {
-			if isClusterScopedResource(resourceType) {
-				obj, err = dynamicClient.Resource(*gvr).Get(ctx, resourceName, metav1.GetOptions{})
-			} else {
-				obj, err = dynamicClient.Resource(*gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			}
-
-			if meta.IsNoMatchError(err) {
-				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-			}
-		} else {
-			return fmt.Errorf("resource type %q not yet implemented for edit command", resourceType)
-		}
+	// Use discovery to resolve resource type
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get resource resolver: %w", err)
 	}
 
+	gvr, namespaced, err := resolver.resolveResource(resourceType)
+	if err != nil {
+		return fmt.Errorf("resource type %q not found: %w", resourceType, err)
+	}
+
+	// Get the resource using dynamic client (fully generic)
+	var obj *unstructured.Unstructured
+	if !namespaced {
+		// Cluster-scoped resource
+		obj, err = dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
+	} else {
+		// Namespace-scoped resource
+		if namespace == "" {
+			return fmt.Errorf("namespace is required for namespaced resource %q", resourceType)
+		}
+		obj, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	}
+
+	if meta.IsNoMatchError(err) {
+		return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed", resourceType)
+	}
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("resource %q not found", resourceName)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get resource: %w", err)
 	}
@@ -3233,12 +2928,17 @@ func editResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicC
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer os.Remove(tmpFile.Name())
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+	}()
 
 	if _, err := tmpFile.Write(yamlData); err != nil {
 		return fmt.Errorf("failed to write temp file: %w", err)
 	}
-	tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
 
 	// Determine editor
 	editor := os.Getenv("EDITOR")
@@ -3267,44 +2967,18 @@ func editResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicC
 		return fmt.Errorf("failed to parse edited YAML: %w", err)
 	}
 
-	// Update the resource
-	switch resourceType {
-	case "pods", "po":
-		var pod corev1.Pod
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(editedObj.Object, &pod); err != nil {
-			return fmt.Errorf("failed to convert to Pod: %w", err)
-		}
-		_, err = clientset.CoreV1().Pods(namespace).Update(ctx, &pod, metav1.UpdateOptions{})
-	case "services", "svc":
-		var svc corev1.Service
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(editedObj.Object, &svc); err != nil {
-			return fmt.Errorf("failed to convert to Service: %w", err)
-		}
-		_, err = clientset.CoreV1().Services(namespace).Update(ctx, &svc, metav1.UpdateOptions{})
-	case "deployments", "deploy":
-		var deploy appsv1.Deployment
-		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(editedObj.Object, &deploy); err != nil {
-			return fmt.Errorf("failed to convert to Deployment: %w", err)
-		}
-		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, &deploy, metav1.UpdateOptions{})
-	default:
-		// Try OpenShift resources
-		gvr := getOpenShiftGVR(resourceType)
-		if gvr != nil {
-			if isClusterScopedResource(resourceType) {
-				_, err = dynamicClient.Resource(*gvr).Update(ctx, &editedObj, metav1.UpdateOptions{})
-			} else {
-				_, err = dynamicClient.Resource(*gvr).Namespace(namespace).Update(ctx, &editedObj, metav1.UpdateOptions{})
-			}
-
-			if meta.IsNoMatchError(err) {
-				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-			}
-		} else {
-			return fmt.Errorf("resource type %q not yet implemented for edit command", resourceType)
-		}
+	// Update the resource using dynamic client (fully generic)
+	if !namespaced {
+		// Cluster-scoped resource
+		_, err = dynamicClient.Resource(gvr).Update(ctx, &editedObj, metav1.UpdateOptions{})
+	} else {
+		// Namespace-scoped resource
+		_, err = dynamicClient.Resource(gvr).Namespace(namespace).Update(ctx, &editedObj, metav1.UpdateOptions{})
 	}
 
+	if meta.IsNoMatchError(err) {
+		return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed", resourceType)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to update resource: %w", err)
 	}
@@ -3314,49 +2988,50 @@ func editResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicC
 }
 
 func deleteResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceNames []string, namespace string, allNamespaces bool, selector string, force bool, maxConcurrency int, out io.Writer, errOut io.Writer) error {
-	resourceType = normalizeResourceType(resourceType)
+	// Use discovery to resolve resource type
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get resource resolver: %w", err)
+	}
+
+	gvr, namespaced, err := resolver.resolveResource(resourceType)
+	if err != nil {
+		return fmt.Errorf("resource type %q not found: %w", resourceType, err)
+	}
 
 	var resourcesToDelete []resourceIdentifier
 
-	// If selector is provided, list resources by selector
+	// If selector is provided, list resources by selector using dynamic client (fully generic)
 	if selector != "" {
 		opts := metav1.ListOptions{LabelSelector: selector}
-		var err error
-		switch resourceType {
-		case "pods", "po":
-			var pods *corev1.PodList
+		var list *unstructured.UnstructuredList
+
+		if !namespaced {
+			// Cluster-scoped resource
+			list, err = dynamicClient.Resource(gvr).List(ctx, opts)
+		} else {
+			// Namespace-scoped resource
 			if allNamespaces {
-				pods, err = clientset.CoreV1().Pods("").List(ctx, opts)
+				list, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, opts)
 			} else {
-				pods, err = clientset.CoreV1().Pods(namespace).List(ctx, opts)
+				list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, opts)
 			}
-			if err != nil {
-				return err
-			}
-			for _, pod := range pods.Items {
-				resourcesToDelete = append(resourcesToDelete, resourceIdentifier{
-					name:      pod.Name,
-					namespace: pod.Namespace,
-				})
-			}
-		case "deployments", "deploy":
-			var deploys *appsv1.DeploymentList
-			if allNamespaces {
-				deploys, err = clientset.AppsV1().Deployments("").List(ctx, opts)
-			} else {
-				deploys, err = clientset.AppsV1().Deployments(namespace).List(ctx, opts)
-			}
-			if err != nil {
-				return err
-			}
-			for _, deploy := range deploys.Items {
-				resourcesToDelete = append(resourcesToDelete, resourceIdentifier{
-					name:      deploy.Name,
-					namespace: deploy.Namespace,
-				})
-			}
-		default:
-			return fmt.Errorf("selector not yet supported for resource type %q", resourceType)
+		}
+
+		if meta.IsNoMatchError(err) {
+			return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed", resourceType)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to list resources: %w", err)
+		}
+
+		for _, item := range list.Items {
+			name, _, _ := unstructured.NestedString(item.Object, "metadata", "name")
+			ns, _, _ := unstructured.NestedString(item.Object, "metadata", "namespace")
+			resourcesToDelete = append(resourcesToDelete, resourceIdentifier{
+				name:      name,
+				namespace: ns,
+			})
 		}
 	} else if len(resourceNames) > 0 {
 		// Delete specific resources
@@ -3395,7 +3070,7 @@ func deleteResources(ctx context.Context, clientset *kubernetes.Clientset, dynam
 		go func() {
 			defer wg.Done()
 			for res := range resourceChan {
-				err := deleteSingleResource(ctx, clientset, dynamicClient, resourceType, res.name, res.namespace, force)
+				err := deleteSingleResource(ctx, dynamicClient, gvr, namespaced, res.name, res.namespace, force)
 				resultChan <- deleteResult{resource: res, err: err}
 			}
 		}()
@@ -3441,135 +3116,66 @@ type resourceIdentifier struct {
 	namespace string
 }
 
-func deleteSingleResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, force bool) error {
+// deleteSingleResource deletes a single resource using dynamic client (fully generic)
+func deleteSingleResource(ctx context.Context, dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, namespaced bool, resourceName string, namespace string, force bool) error {
 	opts := metav1.DeleteOptions{}
 	if force {
 		gracePeriod := int64(0)
 		opts.GracePeriodSeconds = &gracePeriod
 	}
 
-	switch resourceType {
-	case "pods", "po":
-		return clientset.CoreV1().Pods(namespace).Delete(ctx, resourceName, opts)
-	case "services", "svc":
-		return clientset.CoreV1().Services(namespace).Delete(ctx, resourceName, opts)
-	case "deployments", "deploy":
-		return clientset.AppsV1().Deployments(namespace).Delete(ctx, resourceName, opts)
-	case "replicasets", "rs":
-		return clientset.AppsV1().ReplicaSets(namespace).Delete(ctx, resourceName, opts)
-	case "statefulsets", "sts":
-		return clientset.AppsV1().StatefulSets(namespace).Delete(ctx, resourceName, opts)
-	case "daemonsets", "ds":
-		return clientset.AppsV1().DaemonSets(namespace).Delete(ctx, resourceName, opts)
-	case "jobs":
-		return clientset.BatchV1().Jobs(namespace).Delete(ctx, resourceName, opts)
-	case "cronjobs", "cj":
-		return clientset.BatchV1().CronJobs(namespace).Delete(ctx, resourceName, opts)
-	case "configmaps", "cm":
-		return clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, resourceName, opts)
-	case "secrets":
-		return clientset.CoreV1().Secrets(namespace).Delete(ctx, resourceName, opts)
-	case "persistentvolumeclaims", "pvc":
-		return clientset.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, resourceName, opts)
-	case "persistentvolumes", "pv":
-		return clientset.CoreV1().PersistentVolumes().Delete(ctx, resourceName, opts)
-	case "nodes", "no":
-		return clientset.CoreV1().Nodes().Delete(ctx, resourceName, opts)
-	case "namespaces", "ns":
-		return clientset.CoreV1().Namespaces().Delete(ctx, resourceName, opts)
-	case "ingresses", "ing":
-		return clientset.NetworkingV1().Ingresses(namespace).Delete(ctx, resourceName, opts)
-	case "networkpolicies", "netpol":
-		return clientset.NetworkingV1().NetworkPolicies(namespace).Delete(ctx, resourceName, opts)
-	case "serviceaccounts", "sa":
-		return clientset.CoreV1().ServiceAccounts(namespace).Delete(ctx, resourceName, opts)
-	case "rolebindings", "rb":
-		return clientset.RbacV1().RoleBindings(namespace).Delete(ctx, resourceName, opts)
-	case "clusterrolebindings", "crb":
-		return clientset.RbacV1().ClusterRoleBindings().Delete(ctx, resourceName, opts)
-	case "roles":
-		return clientset.RbacV1().Roles(namespace).Delete(ctx, resourceName, opts)
-	case "clusterroles", "cr":
-		return clientset.RbacV1().ClusterRoles().Delete(ctx, resourceName, opts)
-	case "poddisruptionbudgets", "pdb":
-		return clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, resourceName, opts)
-	default:
-		// Try OpenShift resources
-		gvr := getOpenShiftGVR(resourceType)
-		if gvr != nil {
-			if isClusterScopedResource(resourceType) {
-				err := dynamicClient.Resource(*gvr).Delete(ctx, resourceName, opts)
-				if meta.IsNoMatchError(err) {
-					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-				}
-				return err
-			} else {
-				err := dynamicClient.Resource(*gvr).Namespace(namespace).Delete(ctx, resourceName, opts)
-				if meta.IsNoMatchError(err) {
-					return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-				}
-				return err
-			}
+	var err error
+	if !namespaced {
+		// Cluster-scoped resource
+		err = dynamicClient.Resource(gvr).Delete(ctx, resourceName, opts)
+	} else {
+		// Namespace-scoped resource
+		if namespace == "" {
+			return fmt.Errorf("namespace is required for namespaced resource")
 		}
-		return fmt.Errorf("resource type %q not yet implemented for delete command", resourceType)
+		err = dynamicClient.Resource(gvr).Namespace(namespace).Delete(ctx, resourceName, opts)
 	}
+
+	if meta.IsNoMatchError(err) {
+		return fmt.Errorf("resource type is not available in this cluster - the Custom Resource Definition (CRD) may not be installed")
+	}
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("resource %q not found", resourceName)
+	}
+	return err
 }
 
 func describeResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, allNamespaces bool, out io.Writer) error {
-	resourceType = normalizeResourceType(resourceType)
-
-	var obj runtime.Object
-	var err error
-
-	switch resourceType {
-	case "pods", "po":
-		obj, err = clientset.CoreV1().Pods(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-	case "services", "svc":
-		obj, err = clientset.CoreV1().Services(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-	case "deployments", "deploy":
-		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-	case "nodes", "no":
-		obj, err = clientset.CoreV1().Nodes().Get(ctx, resourceName, metav1.GetOptions{})
-	case "namespaces", "ns":
-		obj, err = clientset.CoreV1().Namespaces().Get(ctx, resourceName, metav1.GetOptions{})
-	case "machineconfigpools", "mcp":
-		gvr := schema.GroupVersionResource{
-			Group:    "machineconfiguration.openshift.io",
-			Version:  "v1",
-			Resource: "machineconfigpools",
-		}
-		obj, err = dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
-		if meta.IsNoMatchError(err) {
-			return fmt.Errorf("machine config pool API not available - ensure you're connected to an OpenShift cluster")
-		}
-	case "routes", "route":
-		gvr := schema.GroupVersionResource{
-			Group:    "route.openshift.io",
-			Version:  "v1",
-			Resource: "routes",
-		}
-		obj, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-		if meta.IsNoMatchError(err) {
-			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
-		}
-	default:
-		// Try OpenShift resources
-		gvr := getOpenShiftGVR(resourceType)
-		if gvr != nil {
-			if isClusterScopedResource(resourceType) {
-				obj, err = dynamicClient.Resource(*gvr).Get(ctx, resourceName, metav1.GetOptions{})
-			} else {
-				obj, err = dynamicClient.Resource(*gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
-			}
-
-			if meta.IsNoMatchError(err) {
-				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-			}
-		} else {
-			return fmt.Errorf("resource type %q not yet implemented for describe command", resourceType)
-		}
+	// Use discovery to resolve resource type
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get resource resolver: %w", err)
 	}
 
+	gvr, namespaced, err := resolver.resolveResource(resourceType)
+	if err != nil {
+		return fmt.Errorf("resource type %q not found: %w", resourceType, err)
+	}
+
+	// Get the resource using dynamic client (fully generic)
+	var obj *unstructured.Unstructured
+	if !namespaced {
+		// Cluster-scoped resource
+		obj, err = dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
+	} else {
+		// Namespace-scoped resource
+		if namespace == "" {
+			return fmt.Errorf("namespace is required for namespaced resource %q", resourceType)
+		}
+		obj, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+	}
+
+	if meta.IsNoMatchError(err) {
+		return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed", resourceType)
+	}
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("resource %q not found", resourceName)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get resource: %w", err)
 	}
@@ -3723,18 +3329,27 @@ func applyResources(ctx context.Context, clientset *kubernetes.Clientset, dynami
 }
 
 func patchResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, patchType string, patch string, patchFile string, out io.Writer) error {
-	resourceType = normalizeResourceType(resourceType)
+	// Use discovery to resolve resource type
+	resolver, err := getResourceResolver(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get resource resolver: %w", err)
+	}
+
+	gvr, namespaced, err := resolver.resolveResource(resourceType)
+	if err != nil {
+		return fmt.Errorf("resource type %q not found: %w", resourceType, err)
+	}
 
 	var patchData []byte
-	var err error
-
 	if patchFile != "" {
 		patchData, err = os.ReadFile(patchFile)
 		if err != nil {
 			return fmt.Errorf("failed to read patch file: %w", err)
 		}
-	} else {
+	} else if patch != "" {
 		patchData = []byte(patch)
+	} else {
+		return fmt.Errorf("must specify either -p/--patch or --patch-file")
 	}
 
 	var pt types.PatchType
@@ -3749,41 +3364,24 @@ func patchResource(ctx context.Context, clientset *kubernetes.Clientset, dynamic
 		return fmt.Errorf("invalid patch type: %s (must be strategic, merge, or json)", patchType)
 	}
 
-	switch resourceType {
-	case "pods", "po":
-		_, err = clientset.CoreV1().Pods(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
-	case "services", "svc":
-		_, err = clientset.CoreV1().Services(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
-	case "deployments", "deploy":
-		_, err = clientset.AppsV1().Deployments(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
-	case "routes", "route":
-		gvr := schema.GroupVersionResource{
-			Group:    "route.openshift.io",
-			Version:  "v1",
-			Resource: "routes",
+	// Patch the resource using dynamic client (fully generic)
+	if !namespaced {
+		// Cluster-scoped resource
+		_, err = dynamicClient.Resource(gvr).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
+	} else {
+		// Namespace-scoped resource
+		if namespace == "" {
+			return fmt.Errorf("namespace is required for namespaced resource %q", resourceType)
 		}
 		_, err = dynamicClient.Resource(gvr).Namespace(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
-		if meta.IsNoMatchError(err) {
-			return fmt.Errorf("route API not available - ensure you're connected to an OpenShift cluster")
-		}
-	default:
-		// Try OpenShift resources
-		gvr := getOpenShiftGVR(resourceType)
-		if gvr != nil {
-			if isClusterScopedResource(resourceType) {
-				_, err = dynamicClient.Resource(*gvr).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
-			} else {
-				_, err = dynamicClient.Resource(*gvr).Namespace(namespace).Patch(ctx, resourceName, pt, patchData, metav1.PatchOptions{})
-			}
-
-			if meta.IsNoMatchError(err) {
-				return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed. Ensure you're connected to an OpenShift cluster or that the required operator is installed", resourceType)
-			}
-		} else {
-			return fmt.Errorf("resource type %q not yet implemented for patch command", resourceType)
-		}
 	}
 
+	if meta.IsNoMatchError(err) {
+		return fmt.Errorf("resource type %q is not available in this cluster - the Custom Resource Definition (CRD) may not be installed", resourceType)
+	}
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("resource %q not found", resourceName)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to patch resource: %w", err)
 	}
@@ -3803,8 +3401,15 @@ func newAnnotateCommand() *cobra.Command {
 		Short: "Update the annotations on one or more resources",
 		Long: `Update annotations on one or more resources.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
 Annotations should be in the format "key=value" (to add/update) or "key" (to remove).
 Multiple annotations can be specified separated by commas (no spaces).
+
+Operations on multiple resources are performed concurrently for better performance.
 
 Examples:
   # Add an annotation to a pod
@@ -3816,14 +3421,17 @@ Examples:
   # Remove an annotation
   ocp annotate pod my-pod description
 
-  # Annotate multiple resources
-  ocp annotate pod pod1 pod2 key=value
+  # Annotate multiple resources (concurrent)
+  ocp annotate pod pod1 pod2 pod3 key=value
 
-  # Annotate OpenShift resources
-  ocp annotate route my-route description="My route"`,
+  # Annotate any OpenShift resource
+  ocp annotate route my-route description="My route"
+
+  # Annotate any custom resource (CRD)
+  ocp annotate mycustomresource my-instance version=1.0.0`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
-				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+				return completeResourceTypes(cmd, toComplete)
 			}
 			if len(args) == 1 {
 				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
@@ -3903,8 +3511,15 @@ func newLabelCommand() *cobra.Command {
 		Short: "Update the labels on one or more resources",
 		Long: `Update labels on one or more resources.
 
+This command works with any resource type discovered in your cluster, including:
+- Standard Kubernetes resources
+- OpenShift resources
+- Custom Resource Definitions (CRDs)
+
 Labels should be in the format "key=value" (to add/update) or "key-" (to remove).
 Multiple labels can be specified separated by commas (no spaces).
+
+Operations on multiple resources are performed concurrently for better performance.
 
 Examples:
   # Add a label to a pod
@@ -3916,14 +3531,17 @@ Examples:
   # Remove a label
   ocp label pod my-pod environment-
 
-  # Label multiple resources
-  ocp label pod pod1 pod2 team=platform
+  # Label multiple resources (concurrent)
+  ocp label pod pod1 pod2 pod3 team=platform
 
-  # Label OpenShift resources
-  ocp label route my-route app=myapp`,
+  # Label any OpenShift resource
+  ocp label route my-route app=myapp
+
+  # Label any custom resource (CRD)
+  ocp label mycustomresource my-instance version=1.0.0`,
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) == 0 {
-				return filterCompletions(commonResources, toComplete), cobra.ShellCompDirectiveNoFileComp
+				return completeResourceTypes(cmd, toComplete)
 			}
 			if len(args) == 1 {
 				return completeResourceNames(cmd, args[0], toComplete, namespace, allNamespaces)
@@ -3993,7 +3611,7 @@ Examples:
 }
 
 func annotateResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceNames []string, namespace string, allNamespaces bool, annotationsStr string, maxConcurrency int, out io.Writer, errOut io.Writer) error {
-	resourceType = normalizeResourceType(resourceType)
+	resourceType = normalizeResourceType(ctx, resourceType)
 
 	// Parse comma-separated annotations
 	annotationParts := strings.Split(annotationsStr, ",")
@@ -4064,9 +3682,18 @@ func annotateResources(ctx context.Context, clientset *kubernetes.Clientset, dyn
 		err          error
 	}
 
-	// Normalize resource type once
-	normalizedResourceType := normalizeResourceType(resourceType)
-	isClusterScoped := isClusterScopedResource(normalizedResourceType)
+	// Normalize resource type once using discovery
+	normalizedResourceType := normalizeResourceType(ctx, resourceType)
+
+	// Determine if cluster-scoped using discovery
+	var isClusterScoped bool
+	resolver, err := getResourceResolver(ctx)
+	if err == nil {
+		_, namespaced, err := resolver.resolveResource(normalizedResourceType)
+		if err == nil {
+			isClusterScoped = !namespaced
+		}
+	}
 
 	resourceChan := make(chan string, len(resourceNames))
 	resultChan := make(chan annotateResult, len(resourceNames))
@@ -4144,7 +3771,7 @@ func annotateResources(ctx context.Context, clientset *kubernetes.Clientset, dyn
 }
 
 func annotateSingleResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, patch string) error {
-	resourceType = normalizeResourceType(resourceType)
+	resourceType = normalizeResourceType(ctx, resourceType)
 	patchData := []byte(patch)
 
 	switch resourceType {
@@ -4186,7 +3813,7 @@ func annotateSingleResource(ctx context.Context, clientset *kubernetes.Clientset
 }
 
 func labelResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceNames []string, namespace string, allNamespaces bool, labelsStr string, maxConcurrency int, out io.Writer, errOut io.Writer) error {
-	resourceType = normalizeResourceType(resourceType)
+	resourceType = normalizeResourceType(ctx, resourceType)
 
 	// Parse comma-separated labels
 	labelParts := strings.Split(labelsStr, ",")
@@ -4261,9 +3888,18 @@ func labelResources(ctx context.Context, clientset *kubernetes.Clientset, dynami
 		err          error
 	}
 
-	// Normalize resource type once
-	normalizedResourceType := normalizeResourceType(resourceType)
-	isClusterScoped := isClusterScopedResource(normalizedResourceType)
+	// Normalize resource type once using discovery
+	normalizedResourceType := normalizeResourceType(ctx, resourceType)
+
+	// Determine if cluster-scoped using discovery
+	var isClusterScoped bool
+	resolver, err := getResourceResolver(ctx)
+	if err == nil {
+		_, namespaced, err := resolver.resolveResource(normalizedResourceType)
+		if err == nil {
+			isClusterScoped = !namespaced
+		}
+	}
 
 	resourceChan := make(chan string, len(resourceNames))
 	resultChan := make(chan labelResult, len(resourceNames))
@@ -4341,7 +3977,7 @@ func labelResources(ctx context.Context, clientset *kubernetes.Clientset, dynami
 }
 
 func labelSingleResource(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, resourceType string, resourceName string, namespace string, patch string) error {
-	resourceType = normalizeResourceType(resourceType)
+	resourceType = normalizeResourceType(ctx, resourceType)
 	patchData := []byte(patch)
 
 	switch resourceType {

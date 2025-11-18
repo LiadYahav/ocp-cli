@@ -38,3 +38,10 @@ This product uses the following third-party libraries:
 - github.com/spf13/cobra (CLI framework)
 
 All of the above are licensed under the Apache License 2.0.
+
+**Resource Discovery:**
+This product uses the Kubernetes API server discovery mechanism to dynamically discover
+all available resources (including Custom Resource Definitions/CRDs) in the cluster.
+This allows the CLI to work with any Kubernetes distribution and any custom resources
+without hardcoding resource types. The discovery client (k8s.io/client-go/discovery)
+is used to query the API server for available API groups, versions, and resources.

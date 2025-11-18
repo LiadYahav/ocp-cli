@@ -21,9 +21,8 @@ A powerful command-line tool for managing OpenShift and Kubernetes clusters, des
 ### Prerequisites
 
 - Go 1.24 or later (for building from source)
-- Access to a Kubernetes/OpenShift cluster
-- SSH access to cluster nodes (for node management features)
-- `kubectl` or `oc` configured with cluster access
+- Access to a Kubernetes/OpenShift cluster (via kubeconfig)
+- SSH access to cluster nodes (only required for SSH-related features: `ocp ssh`, `ocp node reboot`, `ocp cluster configure-dns`)
 
 ### Build from Source
 

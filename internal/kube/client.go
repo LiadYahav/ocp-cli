@@ -40,6 +40,12 @@ func configPathFromContext(ctx context.Context) string {
 	return ""
 }
 
+// ConfigPathFromContext returns the kubeconfig path from context, if set.
+// This is exported for use by other packages.
+func ConfigPathFromContext(ctx context.Context) string {
+	return configPathFromContext(ctx)
+}
+
 // WithProjectNamespace returns a context that carries an explicit project namespace.
 // When namespace is empty, the context is returned unchanged.
 func WithProjectNamespace(ctx context.Context, namespace string) context.Context {

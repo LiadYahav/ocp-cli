@@ -45,3 +45,11 @@ all available resources (including Custom Resource Definitions/CRDs) in the clus
 This allows the CLI to work with any Kubernetes distribution and any custom resources
 without hardcoding resource types. The discovery client (k8s.io/client-go/discovery)
 is used to query the API server for available API groups, versions, and resources.
+
+**Resource Aliases and Shortcuts:**
+The CLI provides comprehensive aliases and shortcuts for common resources to improve
+usability. For example, users can use `ocp get mcp` instead of `ocp get machineconfigpools`,
+or `ocp get crd` instead of `ocp get customresourcedefinitions`. All standard Kubernetes
+and OpenShift resource shortcuts are supported (e.g., `po` for pods, `svc` for services,
+`deploy` for deployments, `co` for clusteroperators, `cv` for clusterversions, etc.).
+These aliases are automatically resolved during resource discovery.

@@ -149,18 +149,20 @@ func findNodeIP(addresses []corev1.NodeAddress) string {
 }
 
 func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, commands []string, cobraCmd *cobra.Command) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx = ensureContext(ctx)
+	
+	// Add timeout for SSH connection (but allow long-running commands to continue)
+	connectCtx, cancel := withTimeout(ctx, ShortTimeout)
+	defer cancel()
 
-	ip, err := resolveNodeIP(ctx, nodeName)
+	ip, err := resolveNodeIP(connectCtx, nodeName)
 	if err != nil {
-		return err
+		return formatErrorWithContext(err, "resolveNodeIP", "node", nodeName, "")
 	}
 
 	resolvedIdentityFile, err := resolveIdentityFile(identityFile)
 	if err != nil {
-		return err
+		return formatErrorWithContext(err, "resolveIdentityFile", "", "", "")
 	}
 
 	target := fmt.Sprintf("%s@%s", user, ip)
@@ -188,6 +190,8 @@ func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, com
 		sshArgs = append(sshArgs, combinedCmd)
 	}
 
+	// Use original context for command execution (allows long-running commands)
+	// but respect cancellation
 	sshCmd := exec.CommandContext(ctx, "ssh", sshArgs...)
 	if cobraCmd != nil {
 		sshCmd.Stdin = cobraCmd.InOrStdin()
@@ -195,7 +199,10 @@ func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, com
 		sshCmd.Stderr = cobraCmd.ErrOrStderr()
 	}
 
-	return sshCmd.Run()
+	if err := sshCmd.Run(); err != nil {
+		return formatErrorWithContext(err, "runSSHCommand", "node", nodeName, "")
+	}
+	return nil
 }
 
 // runSSHCommandWithRetry executes an SSH command with retry logic
@@ -246,11 +253,19 @@ func resolveIdentityFile(identityFile string) (string, error) {
 	}
 
 	if resolvedIdentityFile != "" {
-		if _, err := os.Stat(resolvedIdentityFile); err != nil {
+		info, err := os.Stat(resolvedIdentityFile)
+		if err != nil {
 			if os.IsNotExist(err) {
 				return "", fmt.Errorf("identity file %q does not exist", resolvedIdentityFile)
 			}
 			return "", fmt.Errorf("failed to access identity file %q: %w", resolvedIdentityFile, err)
+		}
+		
+		// Validate file permissions - should be 600 (rw-------) or 400 (r--------)
+		mode := info.Mode().Perm()
+		if mode&0077 != 0 {
+			// File is readable/writable by group or others - security risk
+			return "", fmt.Errorf("identity file %q has insecure permissions %s (should be 600 or 400). Fix with: chmod 600 %q", resolvedIdentityFile, mode, resolvedIdentityFile)
 		}
 	}
 

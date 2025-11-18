@@ -210,6 +210,7 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 
 func newNodeDrainCommand() *cobra.Command {
 	var maxConcurrency int
+	var confirm bool
 
 	cmd := &cobra.Command{
 		Use:               "drain <node-name>",
@@ -218,20 +219,27 @@ func newNodeDrainCommand() *cobra.Command {
 		Long: `Drain a node by marking it as unschedulable and evicting all pods.
 The command will automatically add the annotation "node.dana.io/reason: Maintenance" before draining.
 
+**WARNING**: This is a destructive operation that will evict all pods from the node.
+Use --confirm to proceed without prompting.
+
 Pod evictions are performed concurrently for better performance. Use --max-concurrency
 to control the number of concurrent evictions (default: 5).`,
 		Args: cobra.ExactArgs(1),
 		Example: `  # Drain a node (annotation will be added automatically)
-  ocp node drain worker-3
+  ocp node drain worker-3 --confirm
 
   # Drain with custom concurrency
-  ocp node drain worker-3 --max-concurrency 10`,
+  ocp node drain worker-3 --max-concurrency 10 --confirm`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nodeName := args[0]
 
-			ctx := cmd.Context()
-			if ctx == nil {
-				ctx = context.Background()
+			ctx := ensureContext(cmd.Context())
+			
+			// Require confirmation for destructive operation
+			if !confirm {
+				fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: This will evict all pods from node %q\n", nodeName)
+				fmt.Fprintf(cmd.ErrOrStderr(), "Use --confirm to proceed without this prompt\n")
+				return fmt.Errorf("confirmation required for destructive operation. Use --confirm to proceed")
 			}
 
 			node, err := findNodeByName(ctx, nodeName)
@@ -394,6 +402,7 @@ to control the number of concurrent evictions (default: 5).`,
 	}
 
 	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 5, "Maximum number of concurrent pod evictions")
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm destructive operation without prompting")
 
 	return cmd
 }

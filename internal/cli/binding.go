@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1030,48 +1031,61 @@ func whatCanUser(ctx context.Context, clientset *kubernetes.Clientset, userName,
 	var clusterRoles []string
 	var rolesMu sync.Mutex
 	var clusterRolesMu sync.Mutex
-	var wg sync.WaitGroup
+
+	// Use errgroup for better error handling in concurrent operations
+	g, gctx := errgroup.WithContext(ctx)
 
 	// Search RoleBindings
 	if namespace != "" {
 		// Single namespace - no need for concurrency on RoleBindings
-		bindings, err := clientset.RbacV1().RoleBindings(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to list role bindings: %w", err)
-		}
-		for _, binding := range bindings.Items {
-			for _, subject := range binding.Subjects {
-				if subject.Kind == "User" && subject.Name == userName {
-					roles = append(roles, fmt.Sprintf("%s/%s", namespace, binding.RoleRef.Name))
-					break
+		g.Go(func() error {
+			bindings, err := clientset.RbacV1().RoleBindings(namespace).List(gctx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list role bindings in namespace %q: %w", namespace, err)
+			}
+			var foundRoles []string
+			for _, binding := range bindings.Items {
+				for _, subject := range binding.Subjects {
+					if subject.Kind == "User" && subject.Name == userName {
+						foundRoles = append(foundRoles, fmt.Sprintf("%s/%s", namespace, binding.RoleRef.Name))
+						break
+					}
 				}
 			}
-		}
-		// Still need to search ClusterRoleBindings in parallel
+			if len(foundRoles) > 0 {
+				rolesMu.Lock()
+				roles = append(roles, foundRoles...)
+				rolesMu.Unlock()
+			}
+			return nil
+		})
 	} else {
 		// Search all namespaces - parallelize for performance
-		nsList, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to list namespaces: %w", err)
-		}
+		g.Go(func() error {
+			nsList, err := clientset.CoreV1().Namespaces().List(gctx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to list namespaces: %w", err)
+			}
 
-		// Use worker pool pattern for concurrent namespace queries
-		const maxConcurrency = 20
-		nsChan := make(chan string, len(nsList.Items))
-		for _, ns := range nsList.Items {
-			nsChan <- ns.Name
-		}
-		close(nsChan)
+			// Use worker pool pattern for concurrent namespace queries
+			const maxConcurrency = 20
+			nsChan := make(chan string, len(nsList.Items))
+			for _, ns := range nsList.Items {
+				nsChan <- ns.Name
+			}
+			close(nsChan)
 
-		// Launch workers
-		for i := 0; i < maxConcurrency; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for nsName := range nsChan {
-					bindings, err := clientset.RbacV1().RoleBindings(nsName).List(ctx, metav1.ListOptions{})
+			// Launch workers with errgroup
+			workerG, workerCtx := errgroup.WithContext(gctx)
+			workerG.SetLimit(maxConcurrency)
+
+			for nsName := range nsChan {
+				nsName := nsName // capture loop variable
+				workerG.Go(func() error {
+					bindings, err := clientset.RbacV1().RoleBindings(nsName).List(workerCtx, metav1.ListOptions{})
 					if err != nil {
-						continue // Skip namespaces we can't access
+						// Log but don't fail on permission errors for individual namespaces
+						return nil // Continue processing other namespaces
 					}
 					var foundRoles []string
 					for _, binding := range bindings.Items {
@@ -1087,18 +1101,19 @@ func whatCanUser(ctx context.Context, clientset *kubernetes.Clientset, userName,
 						roles = append(roles, foundRoles...)
 						rolesMu.Unlock()
 					}
-				}
-			}()
-		}
+					return nil
+				})
+			}
+
+			return workerG.Wait()
+		})
 	}
 
 	// Search ClusterRoleBindings - can be done in parallel with RoleBindings
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		clusterBindings, err := clientset.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{})
+	g.Go(func() error {
+		clusterBindings, err := clientset.RbacV1().ClusterRoleBindings().List(gctx, metav1.ListOptions{})
 		if err != nil {
-			return // Will be handled after wait
+			return fmt.Errorf("failed to list cluster role bindings: %w", err)
 		}
 		var foundClusterRoles []string
 		for _, binding := range clusterBindings.Items {
@@ -1114,10 +1129,13 @@ func whatCanUser(ctx context.Context, clientset *kubernetes.Clientset, userName,
 			clusterRoles = append(clusterRoles, foundClusterRoles...)
 			clusterRolesMu.Unlock()
 		}
-	}()
+		return nil
+	})
 
-	// Wait for all goroutines to complete
-	wg.Wait()
+	// Wait for all goroutines to complete and check for errors
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("error searching for user roles: %w", err)
+	}
 
 	if len(roles) == 0 && len(clusterRoles) == 0 {
 		fmt.Fprintf(out, "User %q has no roles", userName)

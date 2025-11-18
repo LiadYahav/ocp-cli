@@ -11,7 +11,7 @@ A powerful command-line tool for managing OpenShift and Kubernetes clusters, des
 - **Cluster Operations**: Configure DNS, monitor cluster health, and view cluster information
 - **Machine Config Pool Management**: Pause and resume Machine Config Pools
 - **Project Namespace Management**: Set default namespace for all namespace-scoped commands
-- **Kubectl-like Commands**: Full support for `get`, `create`, `edit`, `delete`, `describe`, `logs`, `apply`, `patch`, `annotate`, and `label`
+- **Kubectl-like Commands**: Full support for `get`, `create`, `edit`, `delete`, `describe`, `logs`, `apply`, `patch`, `annotate`, and `label` (no external dependencies - fully self-contained)
 - **Shell Completion**: Full bash/zsh/fish completion support for all commands and resources
 - **Concurrent Operations**: Parallel execution for multi-resource operations with configurable concurrency
 - **Error Handling**: Robust error handling with retry logic and detailed error messages
@@ -23,6 +23,8 @@ A powerful command-line tool for managing OpenShift and Kubernetes clusters, des
 - Go 1.24 or later (for building from source)
 - Access to a Kubernetes/OpenShift cluster (via kubeconfig)
 - SSH access to cluster nodes (only required for SSH-related features: `ocp ssh`, `ocp node reboot`, `ocp cluster configure-dns`)
+
+**Note**: The OCP CLI is completely standalone and does **NOT** require `kubectl` or `oc` to be installed. All functionality is implemented natively using the Kubernetes client-go library.
 
 ### Build from Source
 
@@ -113,7 +115,10 @@ ocp cluster info
 # Show cluster version
 ocp cluster version
 
-# Watch cluster operators, versions, and MCPs
+# Watch important cluster resources (auto-detects distribution)
+# For OpenShift: shows ClusterOperators, ClusterVersions, and MachineConfigPools
+# For Kubernetes: shows Nodes, Namespaces summary, and Pods summary
+# Refreshes every 1 second with change highlighting
 ocp cluster watch
 ```
 
@@ -257,7 +262,7 @@ ocp project
 
 ### Kubectl-like Commands
 
-All standard kubectl commands are supported with generic resource discovery:
+All standard kubectl-like commands are supported with generic resource discovery. The CLI is fully self-contained and does not require `kubectl` or `oc` to be installed:
 
 #### Get Resources
 
@@ -296,6 +301,33 @@ ocp get mycustomresources
 ocp get routes
 ocp get buildconfigs
 ocp get deploymentconfigs
+
+# Use shortcuts/aliases (works for all resources)
+ocp get mcp                    # Machine Config Pools
+ocp get crd                    # Custom Resource Definitions
+ocp get co                     # Cluster Operators (OpenShift)
+ocp get cv                     # Cluster Versions (OpenShift)
+ocp get po                     # Pods
+ocp get svc                    # Services
+ocp get deploy                 # Deployments
+ocp get no                     # Nodes
+ocp get ns                     # Namespaces
+ocp get cm                     # ConfigMaps
+ocp get secret                 # Secrets
+ocp get pvc                    # PersistentVolumeClaims
+ocp get pv                     # PersistentVolumes
+ocp get sa                     # ServiceAccounts
+ocp get ing                    # Ingresses
+ocp get sts                    # StatefulSets
+ocp get ds                     # DaemonSets
+ocp get rs                     # ReplicaSets
+ocp get cj                     # CronJobs
+ocp get job                    # Jobs
+ocp get hpa                    # HorizontalPodAutoscalers
+ocp get pdb                    # PodDisruptionBudgets
+ocp get np                     # NetworkPolicies
+ocp get csr                    # CertificateSigningRequests
+ocp get sc                     # StorageClasses
 ```
 
 #### Create Resources
@@ -590,17 +622,17 @@ If SSH connections fail:
 
 If a resource type is not recognized:
 
-1. Verify the resource exists in your cluster: `kubectl api-resources | grep <resource-type>`
-2. Check if it's a CRD: `kubectl get crd`
+1. Verify the resource exists in your cluster: `ocp get <resource-type>` (if it fails, the CRD may not be installed)
+2. Check if it's a CRD: `ocp get crd`
 3. Ensure you're using the correct resource name (singular vs plural)
 
 ### Permission Errors
 
 If you get permission errors:
 
-1. Check your kubeconfig context: `kubectl config current-context`
-2. Verify your RBAC permissions: `kubectl auth can-i <verb> <resource>`
-3. Check if you need to switch contexts: `kubectl config use-context <context-name>`
+1. Check your kubeconfig context: `ocp cluster info` (shows current context)
+2. Verify your RBAC permissions: Try the command and check the error message
+3. Check if you need to switch contexts: Use `kubectl config use-context <context-name>` or update your kubeconfig file
 
 ## License
 

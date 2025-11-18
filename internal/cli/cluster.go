@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
 	"strings"
@@ -11,11 +12,13 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	unstructuredhelpers "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/liadyahav/ocp-cli/internal/kube"
 )
@@ -65,22 +68,58 @@ func newClusterInfoCommand() *cobra.Command {
 				return fmt.Errorf("failed to create Kubernetes client: %w", err)
 			}
 
+			// Fetch all data concurrently for better performance
+			var nodes *corev1.NodeList
+			var namespaces *corev1.NamespaceList
+			var pods *corev1.PodList
+			var nodesErr, namespacesErr, podsErr error
+
+			var wg sync.WaitGroup
+			wg.Add(3)
+
 			// Get nodes
-			nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to list nodes: %w", err)
-			}
+			go func() {
+				defer wg.Done()
+				nodes, nodesErr = clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			}()
 
 			// Get namespaces
-			namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to list namespaces: %w", err)
-			}
+			go func() {
+				defer wg.Done()
+				namespaces, namespacesErr = clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+			}()
 
-			// Get all pods (required for accurate count - API handles pagination efficiently)
-			pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return fmt.Errorf("failed to list pods: %w", err)
+			// Get all pods with pagination support for large clusters
+			go func() {
+				defer wg.Done()
+				// Use pagination for better performance on large clusters
+				opts := metav1.ListOptions{Limit: 500}
+				var allPods []corev1.Pod
+				for {
+					list, err := clientset.CoreV1().Pods("").List(ctx, opts)
+					if err != nil {
+						podsErr = err
+						return
+					}
+					allPods = append(allPods, list.Items...)
+					if list.Continue == "" {
+						break
+					}
+					opts.Continue = list.Continue
+				}
+				pods = &corev1.PodList{Items: allPods}
+			}()
+
+			wg.Wait()
+
+			if nodesErr != nil {
+				return fmt.Errorf("failed to list nodes: %w", nodesErr)
+			}
+			if namespacesErr != nil {
+				return fmt.Errorf("failed to list namespaces: %w", namespacesErr)
+			}
+			if podsErr != nil {
+				return fmt.Errorf("failed to list pods: %w", podsErr)
 			}
 
 			fmt.Fprintln(cmd.OutOrStdout(), "Cluster Information:")
@@ -135,8 +174,15 @@ func newClusterVersionCommand() *cobra.Command {
 func newClusterWatchCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "watch",
-		Short: "Watch cluster operators, clusterversion, and machineconfigpools",
-		Example: `  # Continuously watch operators, clusterversion, and MCPs
+		Short: "Watch important cluster resources (auto-detects OpenShift vs Kubernetes)",
+		Long: `Continuously watch and display important cluster resources, refreshing every 1 second.
+
+The command automatically detects the cluster distribution:
+- OpenShift: Shows ClusterOperators, ClusterVersions, and MachineConfigPools
+- Kubernetes: Shows Nodes, Namespaces summary, and Pods summary
+
+Changes are highlighted in yellow for easy identification.`,
+		Example: `  # Watch cluster resources (auto-detects distribution)
   ocp cluster watch`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -144,13 +190,371 @@ func newClusterWatchCommand() *cobra.Command {
 				ctx = context.Background()
 			}
 
-			watchCmd := exec.CommandContext(ctx, "watch", "-n", "1", "-d", "sh", "-c", "oc get co,clusterversion,mcp")
-			watchCmd.Stdin = cmd.InOrStdin()
-			watchCmd.Stdout = cmd.OutOrStdout()
-			watchCmd.Stderr = cmd.ErrOrStderr()
-
-			return watchCmd.Run()
+			return watchClusterResources(ctx, cmd.OutOrStdout())
 		},
+	}
+}
+
+// detectClusterDistribution detects if the cluster is OpenShift or vanilla Kubernetes
+func detectClusterDistribution(ctx context.Context) (string, error) {
+	dynamicClient, err := kube.NewDynamicClient(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Check for OpenShift-specific resources
+	openshiftGVRs := []schema.GroupVersionResource{
+		{Group: "config.openshift.io", Version: "v1", Resource: "clusteroperators"},
+		{Group: "config.openshift.io", Version: "v1", Resource: "clusterversions"},
+		{Group: "route.openshift.io", Version: "v1", Resource: "routes"},
+	}
+
+	for _, gvr := range openshiftGVRs {
+		_, err := dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{Limit: 1})
+		if err == nil {
+			return "openshift", nil
+		}
+		if !meta.IsNoMatchError(err) {
+			// If it's not a "not found" error, it might be a permission issue
+			// but we'll assume it's OpenShift if we can query the API group
+			return "openshift", nil
+		}
+	}
+
+	return "kubernetes", nil
+}
+
+// watchClusterResources continuously watches and displays important cluster resources
+func watchClusterResources(ctx context.Context, out io.Writer) error {
+	dynamicClient, err := kube.NewDynamicClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Detect cluster distribution
+	distro, err := detectClusterDistribution(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to detect cluster distribution: %w", err)
+	}
+
+	// Define resources to watch based on cluster distribution
+	var resources []struct {
+		name string
+		gvr  schema.GroupVersionResource
+	}
+
+	if distro == "openshift" {
+		// OpenShift-specific resources
+		resources = []struct {
+			name string
+			gvr  schema.GroupVersionResource
+		}{
+			{"clusteroperators", schema.GroupVersionResource{Group: "config.openshift.io", Version: "v1", Resource: "clusteroperators"}},
+			{"clusterversions", schema.GroupVersionResource{Group: "config.openshift.io", Version: "v1", Resource: "clusterversions"}},
+			{"machineconfigpools", schema.GroupVersionResource{Group: "machineconfiguration.openshift.io", Version: "v1", Resource: "machineconfigpools"}},
+		}
+	} else {
+		// Vanilla Kubernetes - show important cluster resources
+		clientset, err := kube.NewClientset(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create Kubernetes client: %w", err)
+		}
+
+		// For vanilla K8s, we'll show nodes, namespaces summary, and pods summary
+		// We'll use a different approach - fetch data and display it
+		return watchKubernetesResources(ctx, clientset, out)
+	}
+
+	var lastOutput string
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	// Clear screen and hide cursor
+	fmt.Fprint(out, "\033[2J\033[H\033[?25l")
+	defer fmt.Fprint(out, "\033[?25h") // Show cursor on exit
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			var output strings.Builder
+
+			// Fetch and display each resource type
+			for _, res := range resources {
+				list, err := dynamicClient.Resource(res.gvr).List(ctx, metav1.ListOptions{})
+				if err != nil {
+					// If resource is not available (CRD not installed), skip it
+					if meta.IsNoMatchError(err) {
+						continue
+					}
+					fmt.Fprintf(&output, "Error fetching %s: %v\n", res.name, err)
+					continue
+				}
+
+				// Print header for this resource type
+				fmt.Fprintf(&output, "\n=== %s ===\n", strings.ToUpper(res.name))
+
+				// Print table header
+				if res.name == "clusteroperators" {
+					fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s\n", "NAME", "VERSION", "AVAILABLE", "PROGRESSING")
+				} else if res.name == "clusterversions" {
+					fmt.Fprintf(&output, "%-20s %-30s %-15s\n", "NAME", "VERSION", "AVAILABLE")
+				} else if res.name == "machineconfigpools" {
+					fmt.Fprintf(&output, "%-30s %-15s %-15s %-15s\n", "NAME", "CONFIG", "UPDATED", "UPDATING")
+				}
+
+				// Print each item
+				for _, item := range list.Items {
+					name, _, _ := unstructuredhelpers.NestedString(item.Object, "metadata", "name")
+
+					if res.name == "clusteroperators" {
+						version, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "versions", "0", "version")
+						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
+						available := "Unknown"
+						progressing := "Unknown"
+
+						for _, cond := range conditions {
+							condMap, ok := cond.(map[string]interface{})
+							if !ok {
+								continue
+							}
+							condType, _, _ := unstructuredhelpers.NestedString(condMap, "type")
+							condStatus, _, _ := unstructuredhelpers.NestedString(condMap, "status")
+							if condType == "Available" {
+								available = condStatus
+							}
+							if condType == "Progressing" {
+								progressing = condStatus
+							}
+						}
+
+						if version == "" {
+							version = "<none>"
+						}
+						fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s\n", name, version, available, progressing)
+					} else if res.name == "clusterversions" {
+						version, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "desired", "version")
+						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
+						available := "Unknown"
+
+						for _, cond := range conditions {
+							condMap, ok := cond.(map[string]interface{})
+							if !ok {
+								continue
+							}
+							condType, _, _ := unstructuredhelpers.NestedString(condMap, "type")
+							condStatus, _, _ := unstructuredhelpers.NestedString(condMap, "status")
+							if condType == "Available" {
+								available = condStatus
+							}
+						}
+
+						if version == "" {
+							version = "<none>"
+						}
+						fmt.Fprintf(&output, "%-20s %-30s %-15s\n", name, version, available)
+					} else if res.name == "machineconfigpools" {
+						config, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "configuration", "name")
+						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
+						updated := "False"
+						updating := "False"
+
+						for _, cond := range conditions {
+							condMap, ok := cond.(map[string]interface{})
+							if !ok {
+								continue
+							}
+							condType, _, _ := unstructuredhelpers.NestedString(condMap, "type")
+							condStatus, _, _ := unstructuredhelpers.NestedString(condMap, "status")
+							if condType == "Updated" && condStatus == "True" {
+								updated = "True"
+							}
+							if condType == "Updating" && condStatus == "True" {
+								updating = "True"
+							}
+						}
+
+						if config == "" {
+							config = "<none>"
+						}
+						fmt.Fprintf(&output, "%-30s %-15s %-15s %-15s\n", name, config, updated, updating)
+					}
+				}
+			}
+
+			currentOutput := output.String()
+
+			// Clear screen and move cursor to top
+			fmt.Fprint(out, "\033[2J\033[H")
+
+			// Print timestamp
+			fmt.Fprintf(out, "Every 1.0s: ocp cluster watch (%s)  %s\n\n", distro, time.Now().Format("Mon Jan 2 15:04:05 2006"))
+
+			// Print output with diff highlighting if previous output exists
+			if lastOutput != "" {
+				printDiff(lastOutput, currentOutput, out)
+			} else {
+				fmt.Fprint(out, currentOutput)
+			}
+
+			lastOutput = currentOutput
+		}
+	}
+}
+
+// watchKubernetesResources watches important resources for vanilla Kubernetes clusters
+func watchKubernetesResources(ctx context.Context, clientset *kubernetes.Clientset, out io.Writer) error {
+	var lastOutput string
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	// Clear screen and hide cursor
+	fmt.Fprint(out, "\033[2J\033[H\033[?25l")
+	defer fmt.Fprint(out, "\033[?25h") // Show cursor on exit
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			var output strings.Builder
+
+			// Get nodes
+			nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			if err == nil {
+				fmt.Fprintf(&output, "\n=== NODES ===\n")
+				fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s\n", "NAME", "STATUS", "ROLES", "AGE")
+				for _, node := range nodes.Items {
+					status := "Unknown"
+					for _, cond := range node.Status.Conditions {
+						if cond.Type == corev1.NodeReady {
+							if cond.Status == corev1.ConditionTrue {
+								status = "Ready"
+							} else {
+								status = "NotReady"
+							}
+							break
+						}
+					}
+					roles := ""
+					for key := range node.Labels {
+						if strings.HasPrefix(key, "node-role.kubernetes.io/") {
+							role := strings.TrimPrefix(key, "node-role.kubernetes.io/")
+							if roles != "" {
+								roles += ","
+							}
+							roles += role
+						}
+					}
+					if roles == "" {
+						roles = "<none>"
+					}
+					age := formatAgeHelper(node.CreationTimestamp.Time)
+					fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s\n", node.Name, status, roles, age)
+				}
+			}
+
+			// Get namespaces summary
+			namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+			if err == nil {
+				fmt.Fprintf(&output, "\n=== NAMESPACES ===\n")
+				fmt.Fprintf(&output, "Total: %d\n", len(namespaces.Items))
+			}
+
+			// Get pods summary
+			pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+			if err == nil {
+				fmt.Fprintf(&output, "\n=== PODS ===\n")
+				running := 0
+				pending := 0
+				failed := 0
+				succeeded := 0
+				for _, pod := range pods.Items {
+					switch pod.Status.Phase {
+					case corev1.PodRunning:
+						running++
+					case corev1.PodPending:
+						pending++
+					case corev1.PodFailed:
+						failed++
+					case corev1.PodSucceeded:
+						succeeded++
+					}
+				}
+				fmt.Fprintf(&output, "Total: %d (Running: %d, Pending: %d, Failed: %d, Succeeded: %d)\n",
+					len(pods.Items), running, pending, failed, succeeded)
+			}
+
+			currentOutput := output.String()
+
+			// Clear screen and move cursor to top
+			fmt.Fprint(out, "\033[2J\033[H")
+
+			// Print timestamp
+			fmt.Fprintf(out, "Every 1.0s: ocp cluster watch (kubernetes)  %s\n\n", time.Now().Format("Mon Jan 2 15:04:05 2006"))
+
+			// Print output with diff highlighting if previous output exists
+			if lastOutput != "" {
+				printDiff(lastOutput, currentOutput, out)
+			} else {
+				fmt.Fprint(out, currentOutput)
+			}
+
+			lastOutput = currentOutput
+		}
+	}
+}
+
+// formatAgeHelper formats a time duration as a human-readable age string
+func formatAgeHelper(t time.Time) string {
+	duration := time.Since(t)
+	if duration < time.Minute {
+		return fmt.Sprintf("%ds", int(duration.Seconds()))
+	}
+	if duration < time.Hour {
+		return fmt.Sprintf("%dm", int(duration.Minutes()))
+	}
+	if duration < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(duration.Hours()))
+	}
+	days := int(duration.Hours() / 24)
+	if days < 365 {
+		return fmt.Sprintf("%dd", days)
+	}
+	years := days / 365
+	remainingDays := days % 365
+	if remainingDays == 0 {
+		return fmt.Sprintf("%dy", years)
+	}
+	return fmt.Sprintf("%dy%dd", years, remainingDays)
+}
+
+// printDiff highlights differences between old and new output (similar to watch -d)
+func printDiff(old, new string, out io.Writer) {
+	oldLines := strings.Split(old, "\n")
+	newLines := strings.Split(new, "\n")
+
+	maxLen := len(oldLines)
+	if len(newLines) > maxLen {
+		maxLen = len(newLines)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var oldLine, newLine string
+		if i < len(oldLines) {
+			oldLine = oldLines[i]
+		}
+		if i < len(newLines) {
+			newLine = newLines[i]
+		}
+
+		if oldLine != newLine {
+			// Highlight changed lines
+			fmt.Fprintf(out, "\033[1;33m%s\033[0m\n", newLine) // Yellow for changes
+		} else {
+			fmt.Fprintf(out, "%s\n", newLine)
+		}
 	}
 }
 
@@ -159,6 +563,7 @@ func newClusterConfigureDNSCommand() *cobra.Command {
 	var identityFile string
 	var maxConcurrency int
 	var maxRetries int
+	var confirm bool
 
 	cmd := &cobra.Command{
 		Use:   "configure-dns <nameservers>",
@@ -166,7 +571,10 @@ func newClusterConfigureDNSCommand() *cobra.Command {
 		Long: `Configure DNS servers on every node via NetworkManager.
 
 **RISK**: This command modifies live networking on all nodes. Ensure you have
-         console access before proceeding.`,
+         console access before proceeding.
+
+**WARNING**: This is a destructive operation that modifies system networking.
+Use --confirm to proceed without prompting.`,
 		Example: `  # Prepend a single nameserver while keeping existing entries
   ocp cluster configure-dns 1.1.1.1
 
@@ -177,28 +585,37 @@ func newClusterConfigureDNSCommand() *cobra.Command {
   ocp cluster configure-dns 8.8.8.8 --max-concurrency 10 --max-retries 5`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
-			if ctx == nil {
-				ctx = context.Background()
+			ctx := ensureContext(cmd.Context())
+			
+			// Require confirmation for destructive operation
+			if !confirm {
+				fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: This will modify DNS settings on ALL nodes in the cluster\n")
+				fmt.Fprintf(cmd.ErrOrStderr(), "Ensure you have console access before proceeding\n")
+				fmt.Fprintf(cmd.ErrOrStderr(), "Use --confirm to proceed without this prompt\n")
+				return fmt.Errorf("confirmation required for destructive operation. Use --confirm to proceed")
 			}
+			
+			// Add timeout for DNS configuration operation
+			opCtx, cancel := withTimeout(ctx, LongTimeout)
+			defer cancel()
 
 			nameservers, err := parseNameservers(args[0])
 			if err != nil {
-				return err
+				return formatErrorWithContext(err, "parseNameservers", "", "", "")
 			}
 
-			if err := validateNameservers(ctx, nameservers); err != nil {
-				return err
+			if err := validateNameservers(opCtx, nameservers); err != nil {
+				return formatErrorWithContext(err, "validateNameservers", "", "", "")
 			}
 
-			clientset, err := kube.NewClientset(ctx)
+			clientset, err := kube.NewClientset(opCtx)
 			if err != nil {
-				return fmt.Errorf("failed to create Kubernetes client: %w", err)
+				return formatErrorWithContext(err, "NewClientset", "", "", "")
 			}
 
-			nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			nodes, err := clientset.CoreV1().Nodes().List(opCtx, metav1.ListOptions{})
 			if err != nil {
-				return fmt.Errorf("failed to list nodes: %w", err)
+				return formatErrorWithContext(err, "ListNodes", "nodes", "", "")
 			}
 
 			if len(nodes.Items) == 0 {
@@ -242,7 +659,10 @@ func newClusterConfigureDNSCommand() *cobra.Command {
 					for nodeName := range nodeChan {
 						fmt.Fprintf(cmd.OutOrStdout(), "Configuring DNS on %s...\n", nodeName)
 						script := buildDNSConfigureScript(nameservers, mode)
-						err := runSSHCommandWithRetry(ctx, user, identityFile, nodeName, []string{script}, cmd, maxRetries, time.Second)
+						err := runSSHCommandWithRetry(opCtx, user, identityFile, nodeName, []string{script}, cmd, maxRetries, time.Second)
+						if err != nil {
+							err = formatErrorWithContext(err, "configureDNS", "node", nodeName, "")
+						}
 						resultChan <- nodeResult{nodeName: nodeName, err: err}
 					}
 				}()
@@ -290,6 +710,7 @@ func newClusterConfigureDNSCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&identityFile, "identity", "i", "", "Path to private key file for SSH authentication (default: ~/.ssh/id_rsa_ocp if exists)")
 	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 10, "Maximum number of concurrent SSH connections")
 	cmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Maximum number of retry attempts per node")
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm destructive operation without prompting")
 
 	return cmd
 }
@@ -349,6 +770,14 @@ func parseNameservers(arg string) ([]string, error) {
 		if part == "" {
 			continue
 		}
+		// Validate IP address format
+		if ip := net.ParseIP(part); ip == nil {
+			return nil, fmt.Errorf("invalid IP address: %q", part)
+		}
+		// Sanitize: ensure no shell metacharacters
+		if strings.ContainsAny(part, ";&|`$(){}[]<>\"'\\\n\r\t") {
+			return nil, fmt.Errorf("invalid characters in nameserver: %q", part)
+		}
 		result = append(result, part)
 	}
 
@@ -386,7 +815,12 @@ func queryNameserver(ctx context.Context, nameserver string) error {
 }
 
 func buildDNSConfigureScript(nameservers []string, mode dnsMode) string {
+	// Nameservers are already validated in parseNameservers
+	// Join with comma - safe because IPs are validated
 	joined := strings.Join(nameservers, ",")
+	
+	// Build script with proper escaping
+	// Use single quotes around the DNS value to prevent injection
 	body := fmt.Sprintf(`set -euo pipefail
 conn=$(nmcli -t -f NAME connection show --active | head -n1)
 if [ -z "$conn" ]; then
@@ -394,7 +828,7 @@ if [ -z "$conn" ]; then
   exit 1
 fi
 current=$(nmcli -g ipv4.dns connection show "$conn" | tr -d "\r")
-newdns="%s"
+newdns='%s'
 if [ "%s" = "append" ] && [ -n "$current" ]; then
   newdns="${newdns},${current}"
 fi
@@ -404,5 +838,7 @@ nmcli connection up "$conn" >/dev/null 2>&1 || true
 systemctl restart NetworkManager
 `, joined, mode)
 
-	return fmt.Sprintf("sudo bash -c %q", body)
+	// Escape single quotes in the script body for safe passing to bash -c
+	escapedBody := strings.ReplaceAll(body, "'", "'\"'\"'")
+	return fmt.Sprintf("sudo bash -c '%s'", escapedBody)
 }

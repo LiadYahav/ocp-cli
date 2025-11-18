@@ -7,6 +7,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,6 +45,10 @@ type resourceResolver struct {
 	mapper          meta.RESTMapper
 	resourceCache   map[string]*resourceInfo
 	mu              sync.RWMutex
+	discoverOnce    sync.Once
+	discoverErr     error
+	cacheKey        string
+	createdAt       time.Time
 }
 
 type resourceInfo struct {
@@ -52,20 +58,95 @@ type resourceInfo struct {
 	resourceNames []string // plural forms and aliases
 }
 
-var (
-	resolverCache = make(map[context.Context]*resourceResolver)
-	resolverMu    sync.Mutex
+const (
+	// cacheTTL is the time-to-live for resolver cache entries
+	cacheTTL = 5 * time.Minute
+	// cacheCleanupInterval is how often to clean up expired cache entries
+	cacheCleanupInterval = 1 * time.Minute
 )
 
-// getResourceResolver returns a cached resource resolver for the context
-func getResourceResolver(ctx context.Context) (*resourceResolver, error) {
+var (
+	resolverCache = make(map[string]*resourceResolver)
+	resolverMu    sync.RWMutex
+	lastCleanup   time.Time
+	cleanupMu     sync.Mutex
+)
+
+// getCacheKey generates a stable cache key from the context (kubeconfig path + cluster endpoint)
+func getCacheKey(ctx context.Context) (string, error) {
+	cfg, err := kube.GetConfig(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get config: %w", err)
+	}
+
+	// Use kubeconfig path if available, otherwise use server URL
+	keyParts := []string{}
+	if configPath := kube.ConfigPathFromContext(ctx); configPath != "" {
+		keyParts = append(keyParts, configPath)
+	}
+	if cfg.Host != "" {
+		keyParts = append(keyParts, cfg.Host)
+	}
+	if len(keyParts) == 0 {
+		// Fallback: use in-cluster config indicator
+		keyParts = append(keyParts, "in-cluster")
+	}
+
+	// Create a hash of the key parts for a stable, short key
+	key := strings.Join(keyParts, "|")
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:]), nil
+}
+
+// cleanupExpiredResolvers removes expired resolver cache entries
+func cleanupExpiredResolvers() {
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+
+	now := time.Now()
+	// Only cleanup once per interval to avoid excessive locking
+	if now.Sub(lastCleanup) < cacheCleanupInterval {
+		return
+	}
+	lastCleanup = now
+
 	resolverMu.Lock()
 	defer resolverMu.Unlock()
 
-	if resolver, ok := resolverCache[ctx]; ok {
-		return resolver, nil
+	for key, resolver := range resolverCache {
+		if now.Sub(resolver.createdAt) > cacheTTL {
+			delete(resolverCache, key)
+		}
+	}
+}
+
+// getResourceResolver returns a cached resource resolver for the context
+func getResourceResolver(ctx context.Context) (*resourceResolver, error) {
+	cacheKey, err := getCacheKey(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate cache key: %w", err)
 	}
 
+	// Cleanup expired entries periodically
+	cleanupExpiredResolvers()
+
+	resolverMu.RLock()
+	if resolver, ok := resolverCache[cacheKey]; ok {
+		// Check if cache entry is still valid
+		if time.Since(resolver.createdAt) < cacheTTL {
+			resolverMu.RUnlock()
+			return resolver, nil
+		}
+		// Entry expired, remove it
+		resolverMu.RUnlock()
+		resolverMu.Lock()
+		delete(resolverCache, cacheKey)
+		resolverMu.Unlock()
+	} else {
+		resolverMu.RUnlock()
+	}
+
+	// Create new resolver
 	discoveryClient, err := kube.NewDiscoveryClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create discovery client: %w", err)
@@ -73,43 +154,50 @@ func getResourceResolver(ctx context.Context) (*resourceResolver, error) {
 
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoverycached.NewMemCacheClient(discoveryClient))
 
-	var resolver *resourceResolver
-	resolver = &resourceResolver{
+	resolver := &resourceResolver{
 		discoveryClient: discoveryClient,
 		mapper:          mapper,
 		resourceCache:   make(map[string]*resourceInfo),
+		cacheKey:        cacheKey,
+		createdAt:       time.Now(),
 	}
 
-	// Cache resolver (note: in production, you might want to expire this cache)
-	resolverCache[ctx] = resolver
+	resolverMu.Lock()
+	resolverCache[cacheKey] = resolver
+	resolverMu.Unlock()
 
 	return resolver, nil
 }
 
 // discoverResources discovers all available resources from the API server
+// Uses sync.Once to ensure discovery only happens once per resolver instance
 func (r *resourceResolver) discoverResources() ([]string, error) {
-	r.mu.RLock()
-	if len(r.resourceCache) > 0 {
-		// Return cached resource names
-		resources := make([]string, 0, len(r.resourceCache)*2) // Estimate: plural + aliases
-		for _, info := range r.resourceCache {
-			resources = append(resources, info.resourceNames...)
-		}
-		r.mu.RUnlock()
-		return resources, nil
-	}
-	r.mu.RUnlock()
+	r.discoverOnce.Do(func() {
+		r.discoverErr = r.doDiscoverResources()
+	})
 
+	if r.discoverErr != nil {
+		return nil, r.discoverErr
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	resources := make([]string, 0, len(r.resourceCache)*2) // Estimate: plural + aliases
+	for _, info := range r.resourceCache {
+		resources = append(resources, info.resourceNames...)
+	}
+	return resources, nil
+}
+
+// doDiscoverResources performs the actual resource discovery
+func (r *resourceResolver) doDiscoverResources() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	// Double-check after acquiring write lock
 	if len(r.resourceCache) > 0 {
-		resources := make([]string, 0, len(r.resourceCache)*2)
-		for _, info := range r.resourceCache {
-			resources = append(resources, info.resourceNames...)
-		}
-		return resources, nil
+		return nil
 	}
 
 	// Discover all API resources
@@ -117,7 +205,7 @@ func (r *resourceResolver) discoverResources() ([]string, error) {
 	if err != nil {
 		// If discovery fails, return empty list but don't fail completely
 		// Some clusters may have partial discovery failures
-		return []string{}, nil
+		return nil
 	}
 
 	resourceMap := make(map[string]*resourceInfo)
@@ -155,9 +243,7 @@ func (r *resourceResolver) discoverResources() ([]string, error) {
 			}
 
 			// Add short names if available
-			for _, shortName := range apiResource.ShortNames {
-				resourceNames = append(resourceNames, shortName)
-			}
+			resourceNames = append(resourceNames, apiResource.ShortNames...)
 
 			// Store or merge with existing entry
 			if existing, exists := resourceMap[pluralName]; exists {
@@ -174,27 +260,131 @@ func (r *resourceResolver) discoverResources() ([]string, error) {
 		}
 	}
 
+	// Add common aliases for better usability
+	aliases := map[string]string{
+		"mcp":                         "machineconfigpools",
+		"machineconfigpool":           "machineconfigpools",
+		"crd":                         "customresourcedefinitions",
+		"customresourcedefinition":    "customresourcedefinitions",
+		"cs":                          "componentstatuses",
+		"componentstatus":             "componentstatuses",
+		"csr":                         "certificatesigningrequests",
+		"certificatesigningrequest":   "certificatesigningrequests",
+		"pv":                          "persistentvolumes",
+		"persistentvolume":            "persistentvolumes",
+		"pvc":                         "persistentvolumeclaims",
+		"persistentvolumeclaim":       "persistentvolumeclaims",
+		"sc":                          "storageclasses",
+		"storageclass":                "storageclasses",
+		"sa":                          "serviceaccounts",
+		"serviceaccount":              "serviceaccounts",
+		"cm":                          "configmaps",
+		"configmap":                   "configmaps",
+		"secret":                      "secrets",
+		"ing":                         "ingresses",
+		"ingress":                     "ingresses",
+		"ingressclass":                "ingressclasses",
+		"np":                          "networkpolicies",
+		"networkpolicy":               "networkpolicies",
+		"pdb":                         "poddisruptionbudgets",
+		"poddisruptionbudget":         "poddisruptionbudgets",
+		"hpa":                         "horizontalpodautoscalers",
+		"horizontalpodautoscaler":     "horizontalpodautoscalers",
+		"vpa":                         "verticalpodautoscalers",
+		"verticalpodautoscaler":       "verticalpodautoscalers",
+		"cronjob":                     "cronjobs",
+		"cj":                          "cronjobs",
+		"sts":                         "statefulsets",
+		"statefulset":                 "statefulsets",
+		"ds":                          "daemonsets",
+		"daemonset":                   "daemonsets",
+		"rs":                          "replicasets",
+		"replicaset":                  "replicasets",
+		"rc":                          "replicationcontrollers",
+		"replicationcontroller":       "replicationcontrollers",
+		"ep":                          "endpoints",
+		"endpoint":                    "endpoints",
+		"epslice":                     "endpointslices",
+		"endpointslice":               "endpointslices",
+		"co":                          "clusteroperators",
+		"clusteroperator":             "clusteroperators",
+		"cv":                          "clusterversions",
+		"clusterversion":              "clusterversions",
+		"route":                       "routes",
+		"bc":                          "buildconfigs",
+		"buildconfig":                 "buildconfigs",
+		"build":                       "builds",
+		"dc":                          "deploymentconfigs",
+		"deploymentconfig":            "deploymentconfigs",
+		"is":                          "imagestreams",
+		"imagestream":                 "imagestreams",
+		"istag":                       "imagestreamtags",
+		"imagestreamtag":              "imagestreamtags",
+		"isimage":                     "imagestreamimages",
+		"imagestreamimage":            "imagestreamimages",
+		"template":                    "templates",
+		"project":                     "projects",
+		"crq":                         "clusterresourcequotas",
+		"clusterresourcequota":        "clusterresourcequotas",
+		"scc":                         "securitycontextconstraints",
+		"securitycontextconstraint":   "securitycontextconstraints",
+		"nad":                         "networkattachmentdefinitions",
+		"networkattachmentdefinition": "networkattachmentdefinitions",
+	}
+
+	// Add aliases to existing resources
+	for alias, target := range aliases {
+		if existing, exists := resourceMap[target]; exists {
+			// Add alias if not already present
+			found := false
+			for _, name := range existing.resourceNames {
+				if strings.EqualFold(name, alias) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				existing.resourceNames = append(existing.resourceNames, alias)
+			}
+		}
+	}
+
 	// Update cache
 	r.resourceCache = resourceMap
 
-	// Build resource list for completion
-	resources := make([]string, 0, len(resourceMap)*2)
-	for _, info := range resourceMap {
-		resources = append(resources, info.resourceNames...)
-	}
-
-	return resources, nil
+	return nil
 }
 
 // resolveResource resolves a resource type (including aliases) to its GVR and scope
 func (r *resourceResolver) resolveResource(resourceType string) (schema.GroupVersionResource, bool, error) {
+	// Special case: "all" is handled separately
+	if strings.EqualFold(resourceType, "all") {
+		return schema.GroupVersionResource{}, false, fmt.Errorf("resource type %q is a special keyword - use 'ocp get all' to list common resources", resourceType)
+	}
+
+	// Check if cache needs to be populated
+	r.mu.RLock()
+	cacheLen := len(r.resourceCache)
+	r.mu.RUnlock()
+
+	// If cache is empty, discover resources first
+	if cacheLen == 0 {
+		_, err := r.discoverResources()
+		if err != nil {
+			return schema.GroupVersionResource{}, false, fmt.Errorf("failed to discover resources: %w", err)
+		}
+	}
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Search cache for matching resource
+	// Search cache for matching resource (case-insensitive)
+	// Normalize resource type for comparison (handle singular/plural)
+	normalizedType := strings.ToLower(strings.TrimSpace(resourceType))
+
 	for _, info := range r.resourceCache {
 		for _, name := range info.resourceNames {
-			if strings.EqualFold(name, resourceType) {
+			if strings.EqualFold(name, normalizedType) {
 				return info.gvr, info.namespaced, nil
 			}
 		}
@@ -355,6 +545,11 @@ Examples:
 			resourceName := ""
 			if len(args) > 1 {
 				resourceName = args[1]
+			}
+
+			// Special handling for "all"
+			if strings.EqualFold(resourceType, "all") {
+				return getAllResources(ctx, namespace, allNamespaces, selector, output, showLabels, cmd.OutOrStdout())
 			}
 
 			// Resolve namespace
@@ -1246,8 +1441,12 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 	} else {
 		// Namespace-scoped resource
 		if allNamespaces {
+			// For all namespaces, use empty namespace string which tells the API to list across all namespaces
 			list, err = dynamicClient.Resource(gvr).Namespace("").List(ctx, opts)
 		} else {
+			if namespace == "" {
+				namespace = "default"
+			}
 			list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, opts)
 		}
 	}
@@ -1275,6 +1474,70 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 
 	// Print list
 	return printResourceList(list, output, out, allNamespaces, showLabels, resourceType)
+}
+
+// getAllResources lists common resources (similar to kubectl get all)
+func getAllResources(ctx context.Context, namespace string, allNamespaces bool, selector string, output string, showLabels bool, out io.Writer) error {
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+
+	// Common resources to list (similar to kubectl get all)
+	// These are namespace-scoped resources that are commonly used
+	commonResources := []struct {
+		resourceType string
+		namespaced   bool
+	}{
+		{"pods", true},
+		{"services", true},
+		{"deployments", true},
+		{"replicasets", true},
+		{"statefulsets", true},
+		{"daemonsets", true},
+		{"jobs", true},
+		{"configmaps", true},
+		{"secrets", true},
+		{"persistentvolumeclaims", true},
+	}
+
+	ns := namespace
+	if allNamespaces {
+		ns = ""
+	} else if ns == "" {
+		ns = resolveNamespace(ctx, namespace, false)
+	}
+
+	var allErrors []string
+	hasOutput := false
+
+	for _, res := range commonResources {
+		if res.namespaced && !allNamespaces && ns == "" {
+			ns = "default"
+		}
+
+		err := getResource(ctx, clientset, res.resourceType, "", ns, allNamespaces, selector, output, showLabels, out)
+		if err != nil {
+			// Don't fail completely, just collect errors
+			allErrors = append(allErrors, fmt.Sprintf("%s: %v", res.resourceType, err))
+			continue
+		}
+		hasOutput = true
+	}
+
+	if !hasOutput && len(allErrors) > 0 {
+		return fmt.Errorf("failed to list any resources: %s", strings.Join(allErrors, "; "))
+	}
+
+	if len(allErrors) > 0 {
+		// Print warnings but don't fail
+		fmt.Fprintf(out, "\nWarnings:\n")
+		for _, errMsg := range allErrors {
+			fmt.Fprintf(out, "  %s\n", errMsg)
+		}
+	}
+
+	return nil
 }
 
 // Helper function to get a single resource by name using discovery
@@ -1382,6 +1645,64 @@ func printResourceList(list runtime.Object, output string, out io.Writer, allNam
 	}
 }
 
+// convertUnstructuredToTyped converts unstructured objects to typed objects for known resource types
+func convertUnstructuredToTyped(items []runtime.Object, resourceType string) []runtime.Object {
+	converted := make([]runtime.Object, 0, len(items))
+
+	for _, item := range items {
+		unstructuredObj, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			// Already typed, use as-is
+			converted = append(converted, item)
+			continue
+		}
+
+		// Convert based on resource type
+		switch strings.ToLower(resourceType) {
+		case "pods", "po", "pod":
+			var pod corev1.Pod
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &pod); err == nil {
+				converted = append(converted, &pod)
+			} else {
+				converted = append(converted, item) // Fallback to unstructured
+			}
+		case "services", "svc", "service":
+			var svc corev1.Service
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &svc); err == nil {
+				converted = append(converted, &svc)
+			} else {
+				converted = append(converted, item)
+			}
+		case "deployments", "deploy", "deployment":
+			var deploy appsv1.Deployment
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &deploy); err == nil {
+				converted = append(converted, &deploy)
+			} else {
+				converted = append(converted, item)
+			}
+		case "nodes", "no", "node":
+			var node corev1.Node
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &node); err == nil {
+				converted = append(converted, &node)
+			} else {
+				converted = append(converted, item)
+			}
+		case "namespaces", "ns", "namespace":
+			var ns corev1.Namespace
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &ns); err == nil {
+				converted = append(converted, &ns)
+			} else {
+				converted = append(converted, item)
+			}
+		default:
+			// Unknown type, use unstructured as-is
+			converted = append(converted, item)
+		}
+	}
+
+	return converted
+}
+
 func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
 	items, err := meta.ExtractList(list)
 	if err != nil {
@@ -1392,18 +1713,31 @@ func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces 
 		return nil
 	}
 
+	// Normalize resource type for comparison (handle singular/plural)
+	normalizedType := strings.ToLower(resourceType)
+	if strings.HasSuffix(normalizedType, "s") && len(normalizedType) > 1 {
+		// Try singular form
+		singular := normalizedType[:len(normalizedType)-1]
+		if normalizedType == "pods" || normalizedType == "services" || normalizedType == "deployments" || normalizedType == "nodes" || normalizedType == "namespaces" {
+			normalizedType = singular
+		}
+	}
+
+	// Convert unstructured to typed for known resource types
+	convertedItems := convertUnstructuredToTyped(items, normalizedType)
+
 	// Use dynamic column width calculation like ocp node info
-	switch resourceType {
-	case "pods", "po":
-		return printPodsTable(items, out, allNamespaces, showLabels, false)
-	case "services", "svc":
-		return printServicesTable(items, out, allNamespaces, showLabels, false)
-	case "deployments", "deploy":
-		return printDeploymentsTable(items, out, allNamespaces, showLabels, false)
-	case "nodes", "no":
-		return printNodesTable(items, out, showLabels, false)
-	case "namespaces", "ns":
-		return printNamespacesTable(items, out, showLabels, false)
+	switch normalizedType {
+	case "pods", "po", "pod":
+		return printPodsTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "services", "svc", "service":
+		return printServicesTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "deployments", "deploy", "deployment":
+		return printDeploymentsTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "nodes", "no", "node":
+		return printNodesTable(convertedItems, out, showLabels, false)
+	case "namespaces", "ns", "namespace":
+		return printNamespacesTable(convertedItems, out, showLabels, false)
 	default:
 		// Fallback to simple format
 		return printSimpleTable(items, out, allNamespaces, showLabels)
@@ -1420,18 +1754,31 @@ func printWideResourceList(list runtime.Object, out io.Writer, allNamespaces boo
 		return nil
 	}
 
+	// Normalize resource type for comparison (handle singular/plural)
+	normalizedType := strings.ToLower(resourceType)
+	if strings.HasSuffix(normalizedType, "s") && len(normalizedType) > 1 {
+		// Try singular form
+		singular := normalizedType[:len(normalizedType)-1]
+		if normalizedType == "pods" || normalizedType == "services" || normalizedType == "deployments" || normalizedType == "nodes" || normalizedType == "namespaces" {
+			normalizedType = singular
+		}
+	}
+
+	// Convert unstructured to typed for known resource types
+	convertedItems := convertUnstructuredToTyped(items, normalizedType)
+
 	// Use dynamic column width calculation like ocp node info
-	switch resourceType {
-	case "pods", "po":
-		return printPodsTable(items, out, allNamespaces, showLabels, true)
-	case "services", "svc":
-		return printServicesTable(items, out, allNamespaces, showLabels, true)
-	case "deployments", "deploy":
-		return printDeploymentsTable(items, out, allNamespaces, showLabels, true)
-	case "nodes", "no":
-		return printNodesTable(items, out, showLabels, true)
-	case "namespaces", "ns":
-		return printNamespacesTable(items, out, showLabels, true)
+	switch normalizedType {
+	case "pods", "po", "pod":
+		return printPodsTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "services", "svc", "service":
+		return printServicesTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "deployments", "deploy", "deployment":
+		return printDeploymentsTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "nodes", "no", "node":
+		return printNodesTable(convertedItems, out, showLabels, true)
+	case "namespaces", "ns", "namespace":
+		return printNamespacesTable(convertedItems, out, showLabels, true)
 	default:
 		// Fallback to simple format
 		return printSimpleTable(items, out, allNamespaces, showLabels)

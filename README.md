@@ -5,6 +5,7 @@ A powerful command-line tool for managing OpenShift and Kubernetes clusters, des
 ## Features
 
 - **Generic Resource Support**: Automatically discovers and works with all Kubernetes resources, OpenShift resources, and Custom Resource Definitions (CRDs) in your cluster
+- **Comprehensive Table Output**: kubectl/oc-compatible table formatting for all resource types with proper status, age, and resource-specific columns
 - **Node Management**: Cordon, drain, uncordon, reboot, and manage nodes with automatic annotation handling
 - **RBAC Management**: Manage RoleBindings and ClusterRoleBindings with intuitive commands
 - **SSH Integration**: Execute commands on cluster nodes via SSH with automatic retry logic
@@ -15,16 +16,17 @@ A powerful command-line tool for managing OpenShift and Kubernetes clusters, des
 - **Shell Completion**: Full bash/zsh/fish completion support for all commands and resources
 - **Concurrent Operations**: Parallel execution for multi-resource operations with configurable concurrency
 - **Error Handling**: Robust error handling with retry logic and detailed error messages
+- **Web-Ready Architecture**: Business logic separated from CLI presentation for easy conversion to web applications
 
 ## Installation
 
 ### Prerequisites
 
-- Go 1.24 or later (for building from source)
+- Go 1.25.3 or later (for building from source)
 - Access to a Kubernetes/OpenShift cluster (via kubeconfig)
 - SSH access to cluster nodes (only required for SSH-related features: `ocp ssh`, `ocp node reboot`, `ocp cluster configure-dns`)
 
-**Note**: The OCP CLI is completely standalone and does **NOT** require `kubectl` or `oc` to be installed. All functionality is implemented natively using the Kubernetes client-go library.
+**Note**: The OCP CLI is completely standalone and does **NOT** require `kubectl` or `oc` to be installed. All functionality is implemented natively using the Kubernetes client-go library. Table output formats match kubectl/oc output exactly.
 
 ### Build from Source
 
@@ -34,7 +36,7 @@ git clone <repository-url>
 cd ocp-cli
 
 # Build the binary
-GOTOOLCHAIN=go1.24.3 go build ./cmd/ocp
+go build ./cmd/ocp
 
 # The binary will be created as ./ocp
 # Move it to your PATH
@@ -102,6 +104,30 @@ ocp ssh node-24 "echo hello" "cat /etc/os-release" "uptime"
 
 # With custom identity file and retries
 ocp ssh -i ~/.ssh/id_rsa node-1 "whoami" --max-retries 5
+```
+
+### Diagnostics
+
+Run health checks on cluster nodes (CPU, Memory, Disk, Services):
+
+```bash
+# Diagnose specific node
+ocp diagnose node worker-0
+
+# Diagnose all nodes
+ocp diagnose node
+```
+
+### Get Cleaned YAML
+
+Get resource YAMLs cleaned of runtime metadata (status, uids, managedFields), ready for gitops/apply:
+
+```bash
+# Get cleaned deployment
+ocp clearyml deployment my-app -n my-ns
+
+# Get all deployments in namespace
+ocp clearyml deployments -n my-ns
 ```
 
 ### Cluster Commands
@@ -328,6 +354,70 @@ ocp get pdb                    # PodDisruptionBudgets
 ocp get np                     # NetworkPolicies
 ocp get csr                    # CertificateSigningRequests
 ocp get sc                     # StorageClasses
+```
+
+#### Resource Table Formats
+
+The CLI provides kubectl/oc-compatible table output for all resource types. Here are the columns displayed for each resource:
+
+**Pods** (`ocp get pods`):
+- Default: `NAME`, `READY`, `STATUS`, `RESTARTS`, `AGE`
+- Wide (`-owide`): Adds `NODE`, `IP`, `NODE IP`, `READINESS GATES`
+
+**Deployments** (`ocp get deployments`):
+- Default: `NAME`, `READY`, `UP-TO-DATE`, `AVAILABLE`, `AGE`
+- Wide (`-owide`): Adds `CONTAINERS`, `IMAGES`, `SELECTOR`
+
+**ReplicaSets** (`ocp get replicasets`):
+- Default: `NAME`, `DESIRED`, `CURRENT`, `READY`, `AGE`
+- Wide (`-owide`): Adds `CONTAINERS`, `IMAGES`, `SELECTOR`
+
+**StatefulSets** (`ocp get statefulsets`):
+- Default: `NAME`, `READY`, `AGE`
+- Wide (`-owide`): Adds `CONTAINERS`, `IMAGES`, `SELECTOR`
+
+**DaemonSets** (`ocp get daemonsets`):
+- Default: `NAME`, `DESIRED`, `CURRENT`, `READY`, `UP-TO-DATE`, `AVAILABLE`, `AGE`
+- Wide (`-owide`): Adds `CONTAINERS`, `IMAGES`, `SELECTOR`
+
+**Jobs** (`ocp get jobs`):
+- Default: `NAME`, `COMPLETIONS`, `DURATION`, `AGE`
+- Wide (`-owide`): Adds `CONTAINERS`, `IMAGES`
+
+**CronJobs** (`ocp get cronjobs`):
+- Default: `NAME`, `SCHEDULE`, `SUSPEND`, `ACTIVE`, `LAST SCHEDULE`, `AGE`
+- Wide (`-owide`): Adds `CONTAINERS`, `IMAGES`
+
+**Services** (`ocp get services`):
+- Default: `NAME`, `TYPE`, `CLUSTER-IP`, `EXTERNAL-IP`, `PORT(S)`, `AGE`
+- Wide (`-owide`): Adds `SELECTOR`, `ENDPOINTS`, `SESSION AFFINITY`
+
+**Secrets** (`ocp get secrets`):
+- Default: `NAME`, `TYPE`, `DATA`, `AGE`
+
+**ConfigMaps** (`ocp get configmaps`):
+- Default: `NAME`, `DATA`, `AGE`
+
+**ServiceAccounts** (`ocp get serviceaccounts`):
+- Default: `NAME`, `SECRETS`, `AGE`
+
+**Nodes** (`ocp get nodes`):
+- Default: `NAME`, `STATUS`, `ROLES`, `AGE`, `VERSION`
+- Wide (`-owide`): Adds `INTERNAL-IP`, `EXTERNAL-IP`, `OS-IMAGE`, `KERNEL-VERSION`, `CONTAINER-RUNTIME`
+
+**Namespaces** (`ocp get namespaces`):
+- Default: `NAME`, `STATUS`, `AGE`
+
+**Machine Config Pools** (`ocp get mcp`):
+- Default: `NAME`, `CONFIG`, `UPDATED`, `UPDATING`, `DEGRADED`, `MACHINECOUNT`, `READYMACHINECOUNT`, `UPDATEDMACHINECOUNT`, `DEGRADEDMACHINECOUNT`, `AGE`
+
+**Routes** (`ocp get routes` - OpenShift):
+- Default: `NAME`, `HOST/PORT`, `PATH`, `SERVICES`, `PORT`, `TERMINATION`, `WILDCARD`, `AGE`
+
+All table outputs support:
+- `--show-labels`: Display labels in the last column
+- `-owide` or `-o wide`: Extended output with additional columns
+- `-A` or `--all-namespaces`: Include namespace column and show resources from all namespaces
 ```
 
 #### Create Resources

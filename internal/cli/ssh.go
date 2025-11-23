@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/liadyahav/ocp-cli/internal/pkg/sshutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -209,36 +210,43 @@ func runSSHCommand(ctx context.Context, user, identityFile, nodeName string, com
 // maxRetries: maximum number of retry attempts (default: 3)
 // initialDelay: initial delay between retries (default: 1 second)
 func runSSHCommandWithRetry(ctx context.Context, user, identityFile, nodeName string, commands []string, cobraCmd *cobra.Command, maxRetries int, initialDelay time.Duration) error {
-	if maxRetries <= 0 {
-		maxRetries = 3
+	// Resolve Node IP
+	ip, err := resolveNodeIP(ctx, nodeName)
+	if err != nil {
+		return formatErrorWithContext(err, "resolveNodeIP", "node", nodeName, "")
 	}
-	if initialDelay <= 0 {
-		initialDelay = time.Second
+
+	// Resolve Identity File
+	resolvedIdentityFile, err := resolveIdentityFile(identityFile)
+	if err != nil {
+		return formatErrorWithContext(err, "resolveIdentityFile", "", "", "")
 	}
 
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff: delay = initialDelay * 2^(attempt-1)
-			delay := initialDelay * time.Duration(1<<uint(attempt-1))
-			if cobraCmd != nil {
-				fmt.Fprintf(cobraCmd.ErrOrStderr(), "Retrying SSH to %s (attempt %d/%d) after %v...\n", nodeName, attempt+1, maxRetries+1, delay)
-			}
-			time.Sleep(delay)
-		}
-
-		err := runSSHCommand(ctx, user, identityFile, nodeName, commands, cobraCmd)
-		if err == nil {
-			return nil
-		}
-
-		lastErr = err
-		if cobraCmd != nil {
-			fmt.Fprintf(cobraCmd.ErrOrStderr(), "SSH attempt %d/%d failed for %s: %v\n", attempt+1, maxRetries+1, nodeName, err)
+	// Construct command
+	commandStr := ""
+	if len(commands) > 0 {
+		// Check if the first argument contains semicolons (multiple commands in one string)
+		if len(commands) == 1 && strings.Contains(commands[0], ";") {
+			commandStr = commands[0]
+		} else {
+			// Join arguments with semicolons
+			commandStr = strings.Join(commands, "; ")
 		}
 	}
 
-	return fmt.Errorf("SSH to %s failed after %d attempts: %w", nodeName, maxRetries+1, lastErr)
+	// Initialize runner
+	runner := sshutil.NewRunner(user, resolvedIdentityFile)
+	runner.MaxRetries = maxRetries
+	runner.RetryDelay = initialDelay
+	runner.Stdout = cobraCmd.OutOrStdout()
+	runner.Stderr = cobraCmd.ErrOrStderr()
+
+	// Run command
+	if err := runner.Run(ctx, ip, commandStr); err != nil {
+		return fmt.Errorf("SSH to %s (%s) failed: %w", nodeName, ip, err)
+	}
+
+	return nil
 }
 
 func resolveIdentityFile(identityFile string) (string, error) {

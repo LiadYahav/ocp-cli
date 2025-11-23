@@ -92,6 +92,8 @@ func (c *CLI) configure() {
 		newAnnotateCommand(),
 		newLabelCommand(),
 		newClearYMLCommand(),
+		newDiagnoseCommand(),
+		newTopCommand(),
 		newVersionCommand(),
 		newCompletionCommand(c.root),
 	)

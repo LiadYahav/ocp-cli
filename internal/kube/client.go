@@ -170,6 +170,23 @@ func GetCurrentContext(ctx context.Context) (contextName, clusterName string, er
 	return contextName, clusterName, nil
 }
 
+// GetCurrentNamespace returns the namespace from the current context in kubeconfig
+func GetCurrentNamespace(ctx context.Context) (string, error) {
+	// Check context override first
+	if ns := ProjectNamespaceFromContext(ctx); ns != "" {
+		return ns, nil
+	}
+
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if explicit := configPathFromContext(ctx); explicit != "" {
+		loadingRules.ExplicitPath = explicit
+	}
+
+	configOverrides := &clientcmd.ConfigOverrides{}
+	ns, _, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).Namespace()
+	return ns, err
+}
+
 // GetServerVersion returns the Kubernetes server version, with caching
 func GetServerVersion(ctx context.Context) (*version.Info, error) {
 	// Generate cache key from context

@@ -18,8 +18,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/liadyahav/ocp-cli/internal/pkg/cleaner"
 	"github.com/spf13/cobra"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -445,12 +447,35 @@ func newGetCommand() *cobra.Command {
 		Long: `Display one or many resources.
 
 This command works with any resource type discovered in your cluster, including:
-- Standard Kubernetes resources (pods, services, deployments, etc.)
-- OpenShift resources (routes, buildconfigs, deploymentconfigs, etc.)
+- Standard Kubernetes resources (pods, services, deployments, replicasets, statefulsets, daemonsets, jobs, cronjobs, secrets, configmaps, serviceaccounts, etc.)
+- OpenShift resources (routes, buildconfigs, deploymentconfigs, machineconfigpools, etc.)
 - Custom Resource Definitions (CRDs) installed in your cluster
 
 Resource types are automatically discovered from the API server, so you can use
 any resource type without hardcoding.
+
+Supported output formats:
+  - table (default): Human-readable table format with resource-specific columns
+  - wide (-o wide): Extended table format with additional columns (node, IPs, images, selectors, etc.)
+  - json (-o json): JSON format
+  - yaml (-o yaml): YAML format
+
+Resource-specific table columns:
+  - pods: NAME, READY, STATUS, RESTARTS, AGE (wide: NODE, IP, NODE IP, READINESS GATES)
+  - deployments: NAME, READY, UP-TO-DATE, AVAILABLE, AGE (wide: CONTAINERS, IMAGES, SELECTOR)
+  - replicasets: NAME, DESIRED, CURRENT, READY, AGE (wide: CONTAINERS, IMAGES, SELECTOR)
+  - statefulsets: NAME, READY, AGE (wide: CONTAINERS, IMAGES, SELECTOR)
+  - daemonsets: NAME, DESIRED, CURRENT, READY, UP-TO-DATE, AVAILABLE, AGE (wide: CONTAINERS, IMAGES, SELECTOR)
+  - jobs: NAME, COMPLETIONS, DURATION, AGE (wide: CONTAINERS, IMAGES)
+  - cronjobs: NAME, SCHEDULE, SUSPEND, ACTIVE, LAST SCHEDULE, AGE (wide: CONTAINERS, IMAGES)
+  - services: NAME, TYPE, CLUSTER-IP, EXTERNAL-IP, PORT(S), AGE (wide: SELECTOR, ENDPOINTS, SESSION AFFINITY)
+  - secrets: NAME, TYPE, DATA, AGE
+  - configmaps: NAME, DATA, AGE
+  - serviceaccounts: NAME, SECRETS, AGE
+  - nodes: NAME, STATUS, ROLES, AGE, VERSION (wide: INTERNAL-IP, EXTERNAL-IP, OS-IMAGE, KERNEL-VERSION, CONTAINER-RUNTIME)
+  - namespaces: NAME, STATUS, AGE
+  - machineconfigpools (mcp): NAME, CONFIG, UPDATED, UPDATING, DEGRADED, MACHINECOUNT, READYMACHINECOUNT, UPDATEDMACHINECOUNT, DEGRADEDMACHINECOUNT, AGE
+  - routes: NAME, HOST/PORT, PATH, SERVICES, PORT, TERMINATION, WILDCARD, AGE
 
 Examples:
   # List all pods
@@ -461,6 +486,7 @@ Examples:
 
   # List all resources in all namespaces
   ocp get pods --all-namespaces
+  ocp get pods -A
 
   # List resources with label selector
   ocp get pods -l app=myapp
@@ -470,6 +496,27 @@ Examples:
 
   # Show pods with labels
   ocp get pods --show-labels
+
+  # List deployments with wide output
+  ocp get deployments -owide
+
+  # List secrets, configmaps, serviceaccounts
+  ocp get secrets
+  ocp get configmaps
+  ocp get serviceaccounts
+
+  # List jobs and cronjobs
+  ocp get jobs
+  ocp get cronjobs
+
+  # List replicasets, statefulsets, daemonsets
+  ocp get replicasets
+  ocp get statefulsets
+  ocp get daemonsets
+
+  # List OpenShift resources
+  ocp get routes
+  ocp get mcp
 
   # List any custom resource (CRD)
   ocp get mycustomresources
@@ -508,12 +555,15 @@ Examples:
 
   # List pods in all namespaces
   ocp get pods -A
+  ocp get pods --all-namespaces
 
   # List with label selector
   ocp get pods -l app=myapp
+  ocp get pods --selector app=myapp
 
-  # Show pods with wide output (includes node, IPs)
+  # Show pods with wide output (includes node, IPs, images, selectors)
   ocp get pods -owide
+  ocp get pods -o wide
 
   # Show pods with labels
   ocp get pods --show-labels
@@ -524,7 +574,31 @@ Examples:
   # Output as YAML
   ocp get pods -o yaml
 
-  # List any OpenShift resource (automatically discovered)
+  # List common Kubernetes resources
+  ocp get deployments
+  ocp get replicasets
+  ocp get statefulsets
+  ocp get daemonsets
+  ocp get jobs
+  ocp get cronjobs
+  ocp get secrets
+  ocp get configmaps
+  ocp get serviceaccounts
+  ocp get services
+  ocp get nodes
+  ocp get namespaces
+
+  # List with wide output for more details
+  ocp get deployments -owide
+  ocp get replicasets -owide
+  ocp get statefulsets -owide
+  ocp get daemonsets -owide
+  ocp get jobs -owide
+  ocp get cronjobs -owide
+  ocp get services -owide
+  ocp get nodes -owide
+
+  # List OpenShift resources (automatically discovered)
   ocp get routes
   ocp get buildconfigs
   ocp get deploymentconfigs
@@ -1728,6 +1802,41 @@ func convertUnstructuredToTyped(items []runtime.Object, resourceType string) []r
 			} else {
 				converted = append(converted, item)
 			}
+		case "replicasets", "replicaset", "rs":
+			var rs appsv1.ReplicaSet
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &rs); err == nil {
+				converted = append(converted, &rs)
+			} else {
+				converted = append(converted, item)
+			}
+		case "statefulsets", "statefulset", "sts":
+			var sts appsv1.StatefulSet
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &sts); err == nil {
+				converted = append(converted, &sts)
+			} else {
+				converted = append(converted, item)
+			}
+		case "daemonsets", "daemonset", "ds":
+			var ds appsv1.DaemonSet
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &ds); err == nil {
+				converted = append(converted, &ds)
+			} else {
+				converted = append(converted, item)
+			}
+		case "jobs", "job":
+			var job batchv1.Job
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &job); err == nil {
+				converted = append(converted, &job)
+			} else {
+				converted = append(converted, item)
+			}
+		case "cronjobs", "cronjob", "cj":
+			var cj batchv1.CronJob
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &cj); err == nil {
+				converted = append(converted, &cj)
+			} else {
+				converted = append(converted, item)
+			}
 		default:
 			// Unknown type, use unstructured as-is
 			converted = append(converted, item)
@@ -1772,9 +1881,29 @@ func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces 
 		return printNodesTable(convertedItems, out, showLabels, false)
 	case "namespaces", "ns", "namespace":
 		return printNamespacesTable(convertedItems, out, showLabels, false)
+	case "secrets", "secret":
+		return printSecretsTable(items, out, allNamespaces, showLabels, false)
+	case "configmaps", "configmap", "cm":
+		return printConfigMapsTable(items, out, allNamespaces, showLabels, false)
+	case "serviceaccounts", "serviceaccount", "sa":
+		return printServiceAccountsTable(items, out, allNamespaces, showLabels, false)
+	case "replicasets", "replicaset", "rs":
+		return printReplicaSetsTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "statefulsets", "statefulset", "sts":
+		return printStatefulSetsTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "daemonsets", "daemonset", "ds":
+		return printDaemonSetsTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "jobs", "job":
+		return printJobsTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "cronjobs", "cronjob", "cj":
+		return printCronJobsTable(convertedItems, out, allNamespaces, showLabels, false)
+	case "machineconfigpools", "machineconfigpool", "mcp":
+		return printMCPTable(items, out, showLabels, false)
+	case "routes", "route":
+		return printRoutesTable(items, out, showLabels, allNamespaces, false)
 	default:
-		// Fallback to simple format
-		return printSimpleTable(items, out, allNamespaces, showLabels)
+		// Fallback to improved simple format that extracts real status
+		return printImprovedSimpleTable(items, out, allNamespaces, showLabels, resourceType)
 	}
 }
 
@@ -1813,9 +1942,29 @@ func printWideResourceList(list runtime.Object, out io.Writer, allNamespaces boo
 		return printNodesTable(convertedItems, out, showLabels, true)
 	case "namespaces", "ns", "namespace":
 		return printNamespacesTable(convertedItems, out, showLabels, true)
+	case "secrets", "secret":
+		return printSecretsTable(items, out, allNamespaces, showLabels, true)
+	case "configmaps", "configmap", "cm":
+		return printConfigMapsTable(items, out, allNamespaces, showLabels, true)
+	case "serviceaccounts", "serviceaccount", "sa":
+		return printServiceAccountsTable(items, out, allNamespaces, showLabels, true)
+	case "replicasets", "replicaset", "rs":
+		return printReplicaSetsTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "statefulsets", "statefulset", "sts":
+		return printStatefulSetsTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "daemonsets", "daemonset", "ds":
+		return printDaemonSetsTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "jobs", "job":
+		return printJobsTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "cronjobs", "cronjob", "cj":
+		return printCronJobsTable(convertedItems, out, allNamespaces, showLabels, true)
+	case "machineconfigpools", "machineconfigpool", "mcp":
+		return printMCPTable(items, out, showLabels, true)
+	case "routes", "route":
+		return printRoutesTable(items, out, showLabels, allNamespaces, true)
 	default:
-		// Fallback to simple format
-		return printSimpleTable(items, out, allNamespaces, showLabels)
+		// Fallback to improved simple format that extracts real status
+		return printImprovedSimpleTable(items, out, allNamespaces, showLabels, resourceType)
 	}
 }
 
@@ -2269,8 +2418,8 @@ func printDeploymentsTable(items []runtime.Object, out io.Writer, allNamespaces 
 		readyReplicas := deploy.Status.ReadyReplicas
 		ready := fmt.Sprintf("%d/%d", readyReplicas, totalReplicas)
 
-		upToDate := deploy.Status.UpdatedReplicas
-		available := deploy.Status.AvailableReplicas
+		upToDate := fmt.Sprintf("%d", deploy.Status.UpdatedReplicas)
+		available := fmt.Sprintf("%d", deploy.Status.AvailableReplicas)
 
 		containers := "<none>"
 		images := "<none>"
@@ -2472,7 +2621,7 @@ func printNodesTable(items []runtime.Object, out io.Writer, showLabels bool, wid
 			status = "Unknown"
 		}
 		if node.Spec.Unschedulable {
-			status += ", SchedulingDisabled"
+			status += ",SchedulingDisabled"
 		}
 
 		// Get node roles
@@ -3148,8 +3297,8 @@ func printRoutesTable(items []runtime.Object, out io.Writer, showLabels bool, al
 	return nil
 }
 
-func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool) error {
-	// Fallback simple table
+// printImprovedSimpleTable extracts real status information from unstructured objects
+func printImprovedSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
 	if len(items) == 0 {
 		fmt.Fprintf(out, "No resources found.\n")
 		return nil
@@ -3163,8 +3312,8 @@ func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool,
 		headerParts = append(headerParts, "NAMESPACE")
 	}
 
-	formatParts = append(formatParts, "%-50s", "%-10s", "%-10s")
-	headerParts = append(headerParts, "NAME", "READY", "STATUS")
+	formatParts = append(formatParts, "%-50s", "%-10s")
+	headerParts = append(headerParts, "NAME", "AGE")
 
 	if showLabels {
 		formatParts = append(formatParts, "%-50s")
@@ -3181,11 +3330,18 @@ func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool,
 			continue
 		}
 
+		// Extract age from creation timestamp
+		age := "<unknown>"
+		creationTimestamp := meta.GetCreationTimestamp()
+		if !creationTimestamp.Time.IsZero() {
+			age = formatAge(creationTimestamp.Time)
+		}
+
 		var rowParts []interface{}
 		if allNamespaces {
 			rowParts = append(rowParts, meta.GetNamespace())
 		}
-		rowParts = append(rowParts, meta.GetName(), "-", "Unknown")
+		rowParts = append(rowParts, meta.GetName(), age)
 		if showLabels {
 			labelPairs := make([]string, 0, len(meta.GetLabels()))
 			for k, v := range meta.GetLabels() {
@@ -3203,12 +3359,1492 @@ func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool,
 	return nil
 }
 
+// printSimpleTable is kept for backward compatibility but now calls improved version
+func printSimpleTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool) error {
+	return printImprovedSimpleTable(items, out, allNamespaces, showLabels, "")
+}
+
 func toInterfaceSlice(strs []string) []interface{} {
 	result := make([]interface{}, len(strs))
 	for i, s := range strs {
 		result[i] = s
 	}
 	return result
+}
+
+// Table printing functions for all common Kubernetes resources
+
+func printSecretsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type secretData struct {
+		namespace string
+		name      string
+		typeVal   string
+		data      string
+		age       string
+		labels    string
+	}
+
+	var secretList []secretData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"type":      len("TYPE"),
+		"data":      len("DATA"),
+		"age":       len("AGE"),
+	}
+
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		unstructuredObj, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			// Try typed Secret
+			if secret, ok := item.(*corev1.Secret); ok {
+				typeVal := string(secret.Type)
+				if typeVal == "" {
+					typeVal = "Opaque"
+				}
+				dataCount := len(secret.Data)
+				age := formatAge(secret.CreationTimestamp.Time)
+
+				labels := "<none>"
+				if showLabels && len(secret.Labels) > 0 {
+					labelPairs := make([]string, 0, len(secret.Labels))
+					for k, v := range secret.Labels {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+					}
+					labels = strings.Join(labelPairs, ",")
+				}
+
+				data := secretData{
+					namespace: secret.Namespace,
+					name:      secret.Name,
+					typeVal:   typeVal,
+					data:      fmt.Sprintf("%d", dataCount),
+					age:       age,
+					labels:    labels,
+				}
+				secretList = append(secretList, data)
+
+				// Update widths
+				if len(data.namespace) > widths["namespace"] {
+					widths["namespace"] = len(data.namespace)
+				}
+				if len(data.name) > widths["name"] {
+					widths["name"] = len(data.name)
+				}
+				if len(data.typeVal) > widths["type"] {
+					widths["type"] = len(data.typeVal)
+				}
+				if len(data.data) > widths["data"] {
+					widths["data"] = len(data.data)
+				}
+				if len(data.age) > widths["age"] {
+					widths["age"] = len(data.age)
+				}
+				if showLabels && len(data.labels) > widths["labels"] {
+					widths["labels"] = len(data.labels)
+				}
+			}
+			continue
+		}
+
+		name, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "name")
+		namespace, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "namespace")
+		typeVal, _, _ := unstructured.NestedString(unstructuredObj.Object, "type")
+		if typeVal == "" {
+			typeVal = "Opaque"
+		}
+
+		dataMap, _, _ := unstructured.NestedMap(unstructuredObj.Object, "data")
+		dataCount := len(dataMap)
+
+		creationTimestamp, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "creationTimestamp")
+		age := "<unknown>"
+		if creationTimestamp != "" {
+			createdTime, err := time.Parse(time.RFC3339, creationTimestamp)
+			if err == nil {
+				age = formatAge(createdTime)
+			}
+		}
+
+		labels := "<none>"
+		if showLabels {
+			labelMap, _, _ := unstructured.NestedMap(unstructuredObj.Object, "metadata", "labels")
+			if len(labelMap) > 0 {
+				labelPairs := make([]string, 0, len(labelMap))
+				for k, v := range labelMap {
+					if vStr, ok := v.(string); ok {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, vStr))
+					}
+				}
+				labels = strings.Join(labelPairs, ",")
+			}
+		}
+
+		data := secretData{
+			namespace: namespace,
+			name:      name,
+			typeVal:   typeVal,
+			data:      fmt.Sprintf("%d", dataCount),
+			age:       age,
+			labels:    labels,
+		}
+		secretList = append(secretList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.typeVal) > widths["type"] {
+			widths["type"] = len(data.typeVal)
+		}
+		if len(data.data) > widths["data"] {
+			widths["data"] = len(data.data)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(secretList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["type"]),
+		fmt.Sprintf("%%-%ds", widths["data"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "TYPE", "DATA", "AGE")
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each secret
+	for _, data := range secretList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.typeVal, data.data, data.age)
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printConfigMapsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type cmData struct {
+		namespace string
+		name      string
+		data      string
+		age       string
+		labels    string
+	}
+
+	var cmList []cmData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"data":      len("DATA"),
+		"age":       len("AGE"),
+	}
+
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		unstructuredObj, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			// Try typed ConfigMap
+			if cm, ok := item.(*corev1.ConfigMap); ok {
+				dataCount := len(cm.Data)
+				age := formatAge(cm.CreationTimestamp.Time)
+
+				labels := "<none>"
+				if showLabels && len(cm.Labels) > 0 {
+					labelPairs := make([]string, 0, len(cm.Labels))
+					for k, v := range cm.Labels {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+					}
+					labels = strings.Join(labelPairs, ",")
+				}
+
+				data := cmData{
+					namespace: cm.Namespace,
+					name:      cm.Name,
+					data:      fmt.Sprintf("%d", dataCount),
+					age:       age,
+					labels:    labels,
+				}
+				cmList = append(cmList, data)
+
+				// Update widths
+				if len(data.namespace) > widths["namespace"] {
+					widths["namespace"] = len(data.namespace)
+				}
+				if len(data.name) > widths["name"] {
+					widths["name"] = len(data.name)
+				}
+				if len(data.data) > widths["data"] {
+					widths["data"] = len(data.data)
+				}
+				if len(data.age) > widths["age"] {
+					widths["age"] = len(data.age)
+				}
+				if showLabels && len(data.labels) > widths["labels"] {
+					widths["labels"] = len(data.labels)
+				}
+			}
+			continue
+		}
+
+		name, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "name")
+		namespace, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "namespace")
+
+		dataMap, _, _ := unstructured.NestedMap(unstructuredObj.Object, "data")
+		dataCount := len(dataMap)
+
+		creationTimestamp, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "creationTimestamp")
+		age := "<unknown>"
+		if creationTimestamp != "" {
+			createdTime, err := time.Parse(time.RFC3339, creationTimestamp)
+			if err == nil {
+				age = formatAge(createdTime)
+			}
+		}
+
+		labels := "<none>"
+		if showLabels {
+			labelMap, _, _ := unstructured.NestedMap(unstructuredObj.Object, "metadata", "labels")
+			if len(labelMap) > 0 {
+				labelPairs := make([]string, 0, len(labelMap))
+				for k, v := range labelMap {
+					if vStr, ok := v.(string); ok {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, vStr))
+					}
+				}
+				labels = strings.Join(labelPairs, ",")
+			}
+		}
+
+		data := cmData{
+			namespace: namespace,
+			name:      name,
+			data:      fmt.Sprintf("%d", dataCount),
+			age:       age,
+			labels:    labels,
+		}
+		cmList = append(cmList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.data) > widths["data"] {
+			widths["data"] = len(data.data)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(cmList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["data"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "DATA", "AGE")
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each configmap
+	for _, data := range cmList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.data, data.age)
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printServiceAccountsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type saData struct {
+		namespace string
+		name      string
+		secrets   string
+		age       string
+		labels    string
+	}
+
+	var saList []saData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"secrets":   len("SECRETS"),
+		"age":       len("AGE"),
+	}
+
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		unstructuredObj, ok := item.(*unstructured.Unstructured)
+		if !ok {
+			// Try typed ServiceAccount
+			if sa, ok := item.(*corev1.ServiceAccount); ok {
+				secretsCount := len(sa.Secrets)
+				age := formatAge(sa.CreationTimestamp.Time)
+
+				labels := "<none>"
+				if showLabels && len(sa.Labels) > 0 {
+					labelPairs := make([]string, 0, len(sa.Labels))
+					for k, v := range sa.Labels {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+					}
+					labels = strings.Join(labelPairs, ",")
+				}
+
+				data := saData{
+					namespace: sa.Namespace,
+					name:      sa.Name,
+					secrets:   fmt.Sprintf("%d", secretsCount),
+					age:       age,
+					labels:    labels,
+				}
+				saList = append(saList, data)
+
+				// Update widths
+				if len(data.namespace) > widths["namespace"] {
+					widths["namespace"] = len(data.namespace)
+				}
+				if len(data.name) > widths["name"] {
+					widths["name"] = len(data.name)
+				}
+				if len(data.secrets) > widths["secrets"] {
+					widths["secrets"] = len(data.secrets)
+				}
+				if len(data.age) > widths["age"] {
+					widths["age"] = len(data.age)
+				}
+				if showLabels && len(data.labels) > widths["labels"] {
+					widths["labels"] = len(data.labels)
+				}
+			}
+			continue
+		}
+
+		name, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "name")
+		namespace, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "namespace")
+
+		secrets, _, _ := unstructured.NestedSlice(unstructuredObj.Object, "secrets")
+		secretsCount := len(secrets)
+
+		creationTimestamp, _, _ := unstructured.NestedString(unstructuredObj.Object, "metadata", "creationTimestamp")
+		age := "<unknown>"
+		if creationTimestamp != "" {
+			createdTime, err := time.Parse(time.RFC3339, creationTimestamp)
+			if err == nil {
+				age = formatAge(createdTime)
+			}
+		}
+
+		labels := "<none>"
+		if showLabels {
+			labelMap, _, _ := unstructured.NestedMap(unstructuredObj.Object, "metadata", "labels")
+			if len(labelMap) > 0 {
+				labelPairs := make([]string, 0, len(labelMap))
+				for k, v := range labelMap {
+					if vStr, ok := v.(string); ok {
+						labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, vStr))
+					}
+				}
+				labels = strings.Join(labelPairs, ",")
+			}
+		}
+
+		data := saData{
+			namespace: namespace,
+			name:      name,
+			secrets:   fmt.Sprintf("%d", secretsCount),
+			age:       age,
+			labels:    labels,
+		}
+		saList = append(saList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.secrets) > widths["secrets"] {
+			widths["secrets"] = len(data.secrets)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(saList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["secrets"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "SECRETS", "AGE")
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each serviceaccount
+	for _, data := range saList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.secrets, data.age)
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printReplicaSetsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type rsData struct {
+		namespace  string
+		name       string
+		desired    string
+		current    string
+		ready      string
+		age        string
+		containers string
+		images     string
+		selector   string
+		labels     string
+	}
+
+	var rsList []rsData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"desired":   len("DESIRED"),
+		"current":   len("CURRENT"),
+		"ready":     len("READY"),
+		"age":       len("AGE"),
+	}
+
+	if wide {
+		widths["containers"] = len("CONTAINERS")
+		widths["images"] = len("IMAGES")
+		widths["selector"] = len("SELECTOR")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		rs, ok := item.(*appsv1.ReplicaSet)
+		if !ok {
+			continue
+		}
+
+		desired := int32(1)
+		if rs.Spec.Replicas != nil {
+			desired = *rs.Spec.Replicas
+		}
+		current := rs.Status.Replicas
+		ready := rs.Status.ReadyReplicas
+
+		containers := "<none>"
+		images := "<none>"
+		selector := "<none>"
+
+		if wide {
+			if len(rs.Spec.Template.Spec.Containers) > 0 {
+				containerNames := make([]string, 0, len(rs.Spec.Template.Spec.Containers))
+				imageNames := make([]string, 0, len(rs.Spec.Template.Spec.Containers))
+				for _, c := range rs.Spec.Template.Spec.Containers {
+					containerNames = append(containerNames, c.Name)
+					imageNames = append(imageNames, c.Image)
+				}
+				containers = strings.Join(containerNames, ",")
+				images = strings.Join(imageNames, ",")
+			}
+
+			if rs.Spec.Selector != nil && len(rs.Spec.Selector.MatchLabels) > 0 {
+				selPairs := make([]string, 0, len(rs.Spec.Selector.MatchLabels))
+				for k, v := range rs.Spec.Selector.MatchLabels {
+					selPairs = append(selPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				selector = strings.Join(selPairs, ",")
+			}
+		}
+
+		labels := "<none>"
+		if showLabels && len(rs.Labels) > 0 {
+			labelPairs := make([]string, 0, len(rs.Labels))
+			for k, v := range rs.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := rsData{
+			namespace:  rs.Namespace,
+			name:       rs.Name,
+			desired:    fmt.Sprintf("%d", desired),
+			current:    fmt.Sprintf("%d", current),
+			ready:      fmt.Sprintf("%d", ready),
+			age:        formatAge(rs.CreationTimestamp.Time),
+			containers: containers,
+			images:     images,
+			selector:   selector,
+			labels:     labels,
+		}
+
+		rsList = append(rsList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.desired) > widths["desired"] {
+			widths["desired"] = len(data.desired)
+		}
+		if len(data.current) > widths["current"] {
+			widths["current"] = len(data.current)
+		}
+		if len(data.ready) > widths["ready"] {
+			widths["ready"] = len(data.ready)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.containers) > widths["containers"] {
+				widths["containers"] = len(data.containers)
+			}
+			if len(data.images) > widths["images"] {
+				widths["images"] = len(data.images)
+			}
+			if len(data.selector) > widths["selector"] {
+				widths["selector"] = len(data.selector)
+			}
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(rsList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["desired"]),
+		fmt.Sprintf("%%-%ds", widths["current"]),
+		fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "DESIRED", "CURRENT", "READY", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["containers"]),
+			fmt.Sprintf("%%-%ds", widths["images"]),
+			fmt.Sprintf("%%-%ds", widths["selector"]))
+		headerParts = append(headerParts, "CONTAINERS", "IMAGES", "SELECTOR")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each replicaset
+	for _, data := range rsList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.desired, data.current, data.ready, data.age)
+		if wide {
+			rowParts = append(rowParts, data.containers, data.images, data.selector)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printStatefulSetsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type stsData struct {
+		namespace  string
+		name       string
+		ready      string
+		age        string
+		containers string
+		images     string
+		selector   string
+		labels     string
+	}
+
+	var stsList []stsData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"ready":     len("READY"),
+		"age":       len("AGE"),
+	}
+
+	if wide {
+		widths["containers"] = len("CONTAINERS")
+		widths["images"] = len("IMAGES")
+		widths["selector"] = len("SELECTOR")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		sts, ok := item.(*appsv1.StatefulSet)
+		if !ok {
+			continue
+		}
+
+		replicas := int32(1)
+		if sts.Spec.Replicas != nil {
+			replicas = *sts.Spec.Replicas
+		}
+		readyReplicas := sts.Status.ReadyReplicas
+		ready := fmt.Sprintf("%d/%d", readyReplicas, replicas)
+
+		containers := "<none>"
+		images := "<none>"
+		selector := "<none>"
+
+		if wide {
+			if len(sts.Spec.Template.Spec.Containers) > 0 {
+				containerNames := make([]string, 0, len(sts.Spec.Template.Spec.Containers))
+				imageNames := make([]string, 0, len(sts.Spec.Template.Spec.Containers))
+				for _, c := range sts.Spec.Template.Spec.Containers {
+					containerNames = append(containerNames, c.Name)
+					imageNames = append(imageNames, c.Image)
+				}
+				containers = strings.Join(containerNames, ",")
+				images = strings.Join(imageNames, ",")
+			}
+
+			if sts.Spec.Selector != nil && len(sts.Spec.Selector.MatchLabels) > 0 {
+				selPairs := make([]string, 0, len(sts.Spec.Selector.MatchLabels))
+				for k, v := range sts.Spec.Selector.MatchLabels {
+					selPairs = append(selPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				selector = strings.Join(selPairs, ",")
+			}
+		}
+
+		labels := "<none>"
+		if showLabels && len(sts.Labels) > 0 {
+			labelPairs := make([]string, 0, len(sts.Labels))
+			for k, v := range sts.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := stsData{
+			namespace:  sts.Namespace,
+			name:       sts.Name,
+			ready:      ready,
+			age:        formatAge(sts.CreationTimestamp.Time),
+			containers: containers,
+			images:     images,
+			selector:   selector,
+			labels:     labels,
+		}
+
+		stsList = append(stsList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.ready) > widths["ready"] {
+			widths["ready"] = len(data.ready)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.containers) > widths["containers"] {
+				widths["containers"] = len(data.containers)
+			}
+			if len(data.images) > widths["images"] {
+				widths["images"] = len(data.images)
+			}
+			if len(data.selector) > widths["selector"] {
+				widths["selector"] = len(data.selector)
+			}
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(stsList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "READY", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["containers"]),
+			fmt.Sprintf("%%-%ds", widths["images"]),
+			fmt.Sprintf("%%-%ds", widths["selector"]))
+		headerParts = append(headerParts, "CONTAINERS", "IMAGES", "SELECTOR")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each statefulset
+	for _, data := range stsList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.ready, data.age)
+		if wide {
+			rowParts = append(rowParts, data.containers, data.images, data.selector)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printDaemonSetsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type dsData struct {
+		namespace  string
+		name       string
+		desired    string
+		current    string
+		ready      string
+		upToDate   string
+		available  string
+		age        string
+		containers string
+		images     string
+		selector   string
+		labels     string
+	}
+
+	var dsList []dsData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"desired":   len("DESIRED"),
+		"current":   len("CURRENT"),
+		"ready":     len("READY"),
+		"upToDate":  len("UP-TO-DATE"),
+		"available": len("AVAILABLE"),
+		"age":       len("AGE"),
+	}
+
+	if wide {
+		widths["containers"] = len("CONTAINERS")
+		widths["images"] = len("IMAGES")
+		widths["selector"] = len("SELECTOR")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		ds, ok := item.(*appsv1.DaemonSet)
+		if !ok {
+			continue
+		}
+
+		desired := ds.Status.DesiredNumberScheduled
+		current := ds.Status.CurrentNumberScheduled
+		ready := ds.Status.NumberReady
+		upToDate := ds.Status.UpdatedNumberScheduled
+		available := ds.Status.NumberAvailable
+
+		containers := "<none>"
+		images := "<none>"
+		selector := "<none>"
+
+		if wide {
+			if len(ds.Spec.Template.Spec.Containers) > 0 {
+				containerNames := make([]string, 0, len(ds.Spec.Template.Spec.Containers))
+				imageNames := make([]string, 0, len(ds.Spec.Template.Spec.Containers))
+				for _, c := range ds.Spec.Template.Spec.Containers {
+					containerNames = append(containerNames, c.Name)
+					imageNames = append(imageNames, c.Image)
+				}
+				containers = strings.Join(containerNames, ",")
+				images = strings.Join(imageNames, ",")
+			}
+
+			if ds.Spec.Selector != nil && len(ds.Spec.Selector.MatchLabels) > 0 {
+				selPairs := make([]string, 0, len(ds.Spec.Selector.MatchLabels))
+				for k, v := range ds.Spec.Selector.MatchLabels {
+					selPairs = append(selPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				selector = strings.Join(selPairs, ",")
+			}
+		}
+
+		labels := "<none>"
+		if showLabels && len(ds.Labels) > 0 {
+			labelPairs := make([]string, 0, len(ds.Labels))
+			for k, v := range ds.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := dsData{
+			namespace:  ds.Namespace,
+			name:       ds.Name,
+			desired:    fmt.Sprintf("%d", desired),
+			current:    fmt.Sprintf("%d", current),
+			ready:      fmt.Sprintf("%d", ready),
+			upToDate:   fmt.Sprintf("%d", upToDate),
+			available:  fmt.Sprintf("%d", available),
+			age:        formatAge(ds.CreationTimestamp.Time),
+			containers: containers,
+			images:     images,
+			selector:   selector,
+			labels:     labels,
+		}
+
+		dsList = append(dsList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.desired) > widths["desired"] {
+			widths["desired"] = len(data.desired)
+		}
+		if len(data.current) > widths["current"] {
+			widths["current"] = len(data.current)
+		}
+		if len(data.ready) > widths["ready"] {
+			widths["ready"] = len(data.ready)
+		}
+		if len(data.upToDate) > widths["upToDate"] {
+			widths["upToDate"] = len(data.upToDate)
+		}
+		if len(data.available) > widths["available"] {
+			widths["available"] = len(data.available)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.containers) > widths["containers"] {
+				widths["containers"] = len(data.containers)
+			}
+			if len(data.images) > widths["images"] {
+				widths["images"] = len(data.images)
+			}
+			if len(data.selector) > widths["selector"] {
+				widths["selector"] = len(data.selector)
+			}
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(dsList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["desired"]),
+		fmt.Sprintf("%%-%ds", widths["current"]),
+		fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["upToDate"]),
+		fmt.Sprintf("%%-%ds", widths["available"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "DESIRED", "CURRENT", "READY", "UP-TO-DATE", "AVAILABLE", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["containers"]),
+			fmt.Sprintf("%%-%ds", widths["images"]),
+			fmt.Sprintf("%%-%ds", widths["selector"]))
+		headerParts = append(headerParts, "CONTAINERS", "IMAGES", "SELECTOR")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each daemonset
+	for _, data := range dsList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.desired, data.current, data.ready, data.upToDate, data.available, data.age)
+		if wide {
+			rowParts = append(rowParts, data.containers, data.images, data.selector)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printJobsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type jobData struct {
+		namespace  string
+		name       string
+		complete   string
+		duration   string
+		age        string
+		containers string
+		images     string
+		labels     string
+	}
+
+	var jobList []jobData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"complete":  len("COMPLETIONS"),
+		"duration":  len("DURATION"),
+		"age":       len("AGE"),
+	}
+
+	if wide {
+		widths["containers"] = len("CONTAINERS")
+		widths["images"] = len("IMAGES")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		job, ok := item.(*batchv1.Job)
+		if !ok {
+			continue
+		}
+
+		completions := int32(1)
+		if job.Spec.Completions != nil {
+			completions = *job.Spec.Completions
+		}
+		succeeded := job.Status.Succeeded
+		complete := fmt.Sprintf("%d/%d", succeeded, completions)
+
+		// Calculate duration
+		duration := "<none>"
+		if job.Status.StartTime != nil {
+			if job.Status.CompletionTime != nil {
+				dur := job.Status.CompletionTime.Time.Sub(job.Status.StartTime.Time)
+				if dur.Hours() >= 24 {
+					duration = fmt.Sprintf("%dd", int(dur.Hours()/24))
+				} else if dur.Hours() >= 1 {
+					duration = fmt.Sprintf("%dh", int(dur.Hours()))
+				} else if dur.Minutes() >= 1 {
+					duration = fmt.Sprintf("%dm", int(dur.Minutes()))
+				} else {
+					duration = fmt.Sprintf("%ds", int(dur.Seconds()))
+				}
+			} else {
+				dur := time.Since(job.Status.StartTime.Time)
+				if dur.Hours() >= 24 {
+					duration = fmt.Sprintf("%dd", int(dur.Hours()/24))
+				} else if dur.Hours() >= 1 {
+					duration = fmt.Sprintf("%dh", int(dur.Hours()))
+				} else if dur.Minutes() >= 1 {
+					duration = fmt.Sprintf("%dm", int(dur.Minutes()))
+				} else {
+					duration = fmt.Sprintf("%ds", int(dur.Seconds()))
+				}
+			}
+		}
+
+		containers := "<none>"
+		images := "<none>"
+
+		if wide {
+			if len(job.Spec.Template.Spec.Containers) > 0 {
+				containerNames := make([]string, 0, len(job.Spec.Template.Spec.Containers))
+				imageNames := make([]string, 0, len(job.Spec.Template.Spec.Containers))
+				for _, c := range job.Spec.Template.Spec.Containers {
+					containerNames = append(containerNames, c.Name)
+					imageNames = append(imageNames, c.Image)
+				}
+				containers = strings.Join(containerNames, ",")
+				images = strings.Join(imageNames, ",")
+			}
+		}
+
+		labels := "<none>"
+		if showLabels && len(job.Labels) > 0 {
+			labelPairs := make([]string, 0, len(job.Labels))
+			for k, v := range job.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := jobData{
+			namespace:  job.Namespace,
+			name:       job.Name,
+			complete:   complete,
+			duration:   duration,
+			age:        formatAge(job.CreationTimestamp.Time),
+			containers: containers,
+			images:     images,
+			labels:     labels,
+		}
+
+		jobList = append(jobList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.complete) > widths["complete"] {
+			widths["complete"] = len(data.complete)
+		}
+		if len(data.duration) > widths["duration"] {
+			widths["duration"] = len(data.duration)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.containers) > widths["containers"] {
+				widths["containers"] = len(data.containers)
+			}
+			if len(data.images) > widths["images"] {
+				widths["images"] = len(data.images)
+			}
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(jobList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["complete"]),
+		fmt.Sprintf("%%-%ds", widths["duration"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "COMPLETIONS", "DURATION", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["containers"]),
+			fmt.Sprintf("%%-%ds", widths["images"]))
+		headerParts = append(headerParts, "CONTAINERS", "IMAGES")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each job
+	for _, data := range jobList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.complete, data.duration, data.age)
+		if wide {
+			rowParts = append(rowParts, data.containers, data.images)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
+
+func printCronJobsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type cjData struct {
+		namespace    string
+		name         string
+		schedule     string
+		suspend      string
+		active       string
+		lastSchedule string
+		age          string
+		containers   string
+		images       string
+		labels       string
+	}
+
+	var cjList []cjData
+	widths := map[string]int{
+		"namespace":    len("NAMESPACE"),
+		"name":         len("NAME"),
+		"schedule":     len("SCHEDULE"),
+		"suspend":      len("SUSPEND"),
+		"active":       len("ACTIVE"),
+		"lastSchedule": len("LAST SCHEDULE"),
+		"age":          len("AGE"),
+	}
+
+	if wide {
+		widths["containers"] = len("CONTAINERS")
+		widths["images"] = len("IMAGES")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for _, item := range items {
+		cj, ok := item.(*batchv1.CronJob)
+		if !ok {
+			continue
+		}
+
+		schedule := cj.Spec.Schedule
+		suspend := "False"
+		if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
+			suspend = "True"
+		}
+		active := fmt.Sprintf("%d", len(cj.Status.Active))
+
+		lastSchedule := "<none>"
+		if cj.Status.LastScheduleTime != nil {
+			lastSchedule = formatAge(cj.Status.LastScheduleTime.Time)
+		} else if cj.Status.LastSuccessfulTime != nil {
+			lastSchedule = formatAge(cj.Status.LastSuccessfulTime.Time)
+		}
+
+		containers := "<none>"
+		images := "<none>"
+
+		if wide {
+			if len(cj.Spec.JobTemplate.Spec.Template.Spec.Containers) > 0 {
+				containerNames := make([]string, 0, len(cj.Spec.JobTemplate.Spec.Template.Spec.Containers))
+				imageNames := make([]string, 0, len(cj.Spec.JobTemplate.Spec.Template.Spec.Containers))
+				for _, c := range cj.Spec.JobTemplate.Spec.Template.Spec.Containers {
+					containerNames = append(containerNames, c.Name)
+					imageNames = append(imageNames, c.Image)
+				}
+				containers = strings.Join(containerNames, ",")
+				images = strings.Join(imageNames, ",")
+			}
+		}
+
+		labels := "<none>"
+		if showLabels && len(cj.Labels) > 0 {
+			labelPairs := make([]string, 0, len(cj.Labels))
+			for k, v := range cj.Labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			labels = strings.Join(labelPairs, ",")
+		}
+
+		data := cjData{
+			namespace:    cj.Namespace,
+			name:         cj.Name,
+			schedule:     schedule,
+			suspend:      suspend,
+			active:       active,
+			lastSchedule: lastSchedule,
+			age:          formatAge(cj.CreationTimestamp.Time),
+			containers:   containers,
+			images:       images,
+			labels:       labels,
+		}
+
+		cjList = append(cjList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.schedule) > widths["schedule"] {
+			widths["schedule"] = len(data.schedule)
+		}
+		if len(data.suspend) > widths["suspend"] {
+			widths["suspend"] = len(data.suspend)
+		}
+		if len(data.active) > widths["active"] {
+			widths["active"] = len(data.active)
+		}
+		if len(data.lastSchedule) > widths["lastSchedule"] {
+			widths["lastSchedule"] = len(data.lastSchedule)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.containers) > widths["containers"] {
+				widths["containers"] = len(data.containers)
+			}
+			if len(data.images) > widths["images"] {
+				widths["images"] = len(data.images)
+			}
+		}
+		if showLabels && len(data.labels) > widths["labels"] {
+			widths["labels"] = len(data.labels)
+		}
+	}
+
+	if len(cjList) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["schedule"]),
+		fmt.Sprintf("%%-%ds", widths["suspend"]),
+		fmt.Sprintf("%%-%ds", widths["active"]),
+		fmt.Sprintf("%%-%ds", widths["lastSchedule"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "SCHEDULE", "SUSPEND", "ACTIVE", "LAST SCHEDULE", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["containers"]),
+			fmt.Sprintf("%%-%ds", widths["images"]))
+		headerParts = append(headerParts, "CONTAINERS", "IMAGES")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each cronjob
+	for _, data := range cjList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.schedule, data.suspend, data.active, data.lastSchedule, data.age)
+		if wide {
+			rowParts = append(rowParts, data.containers, data.images)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
 }
 
 // Helper functions for resource status extraction
@@ -4715,87 +6351,18 @@ func clearYMLResource(ctx context.Context, clientset *kubernetes.Clientset, dyna
 
 	// Clean and output YAML
 	if obj != nil {
-		cleaned := cleanUnstructuredObject(obj)
+		cleaned := obj.DeepCopy()
+		cleaner.CleanUnstructuredObject(cleaned)
 		return printCleanedYAML(cleaned, out)
 	} else {
 		// Clean each item in the list
 		cleanedItems := make([]*unstructured.Unstructured, 0, len(list.Items))
 		for i := range list.Items {
-			cleaned := cleanUnstructuredObject(&list.Items[i])
+			cleaned := list.Items[i].DeepCopy()
+			cleaner.CleanUnstructuredObject(cleaned)
 			cleanedItems = append(cleanedItems, cleaned)
 		}
 		return printCleanedYAMLList(cleanedItems, out)
-	}
-}
-
-// cleanUnstructuredObject removes unnecessary fields from a Kubernetes resource
-// This creates a clean YAML suitable for version control or reapplying
-func cleanUnstructuredObject(obj *unstructured.Unstructured) *unstructured.Unstructured {
-	cleaned := obj.DeepCopy()
-
-	// Remove status field (runtime data that shouldn't be in declarative config)
-	delete(cleaned.Object, "status")
-
-	// Clean metadata - remove auto-generated fields
-	if metadata, ok := cleaned.Object["metadata"].(map[string]interface{}); ok {
-		// Remove fields that are auto-generated or not needed for applying
-		delete(metadata, "uid")               // Unique identifier, auto-generated
-		delete(metadata, "resourceVersion")   // Version for optimistic concurrency, auto-generated
-		delete(metadata, "generation")        // Generation counter, auto-generated
-		delete(metadata, "creationTimestamp") // Creation time, auto-generated
-		delete(metadata, "managedFields")     // Server-side apply tracking, auto-generated
-		delete(metadata, "selfLink")          // Deprecated API endpoint, auto-generated
-
-		// Preserve important fields:
-		// - name, namespace (required for identification)
-		// - labels, annotations (user-defined metadata)
-		// - finalizers (important for resource lifecycle)
-		// - ownerReferences (important for garbage collection)
-	}
-
-	// Remove empty/null fields recursively (but preserve empty strings as they might be valid)
-	removeEmptyFields(cleaned.Object)
-
-	return cleaned
-}
-
-// removeEmptyFields recursively removes empty maps, null values, and empty slices
-// Note: We preserve empty strings as they might be valid values in some contexts
-func removeEmptyFields(obj interface{}) {
-	switch v := obj.(type) {
-	case map[string]interface{}:
-		// Collect keys to delete to avoid modifying map during iteration
-		keysToDelete := make([]string, 0)
-		for key, val := range v {
-			switch val := val.(type) {
-			case map[string]interface{}:
-				removeEmptyFields(val)
-				if len(val) == 0 {
-					keysToDelete = append(keysToDelete, key)
-				}
-			case []interface{}:
-				if len(val) == 0 {
-					keysToDelete = append(keysToDelete, key)
-				} else {
-					// Clean items in slice
-					for _, item := range val {
-						removeEmptyFields(item)
-					}
-				}
-			case nil:
-				keysToDelete = append(keysToDelete, key)
-				// Note: We don't remove empty strings as they might be valid values
-				// (e.g., empty imagePullPolicy, empty command, etc.)
-			}
-		}
-		// Delete collected keys
-		for _, key := range keysToDelete {
-			delete(v, key)
-		}
-	case []interface{}:
-		for _, item := range v {
-			removeEmptyFields(item)
-		}
 	}
 }
 

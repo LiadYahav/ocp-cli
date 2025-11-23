@@ -297,11 +297,11 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 
 				// Print table header
 				if res.name == "clusteroperators" {
-					fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s\n", "NAME", "VERSION", "AVAILABLE", "PROGRESSING")
+					fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s %-15s\n", "NAME", "VERSION", "AVAILABLE", "PROGRESSING", "DEGRADED")
 				} else if res.name == "clusterversions" {
 					fmt.Fprintf(&output, "%-20s %-30s %-15s\n", "NAME", "VERSION", "AVAILABLE")
 				} else if res.name == "machineconfigpools" {
-					fmt.Fprintf(&output, "%-30s %-15s %-15s %-15s\n", "NAME", "CONFIG", "UPDATED", "UPDATING")
+					fmt.Fprintf(&output, "%-30s %-20s %-10s %-10s %-10s\n", "NAME", "CONFIG", "UPDATED", "UPDATING", "DEGRADED")
 				}
 
 				// Print each item
@@ -309,7 +309,60 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 					name, _, _ := unstructuredhelpers.NestedString(item.Object, "metadata", "name")
 
 					if res.name == "clusteroperators" {
-						version, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "versions", "0", "version")
+						// Try to find version
+						version := "<none>"
+						if versions, found, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "versions"); found {
+							for _, v := range versions {
+								if vMap, ok := v.(map[string]interface{}); ok {
+									// Prefer "operator" version, or take the first one
+									vName, _, _ := unstructuredhelpers.NestedString(vMap, "name")
+									vVer, _, _ := unstructuredhelpers.NestedString(vMap, "version")
+									if vName == "operator" {
+										version = vVer
+										break
+									}
+									if version == "<none>" {
+										version = vVer
+									}
+								}
+							}
+						}
+						
+						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
+						available := "Unknown"
+						progressing := "Unknown"
+						degraded := "Unknown"
+
+						for _, cond := range conditions {
+							condMap, ok := cond.(map[string]interface{})
+							if !ok {
+								continue
+							}
+							condType, _, _ := unstructuredhelpers.NestedString(condMap, "type")
+							condStatus, _, _ := unstructuredhelpers.NestedString(condMap, "status")
+							if condType == "Available" {
+								available = condStatus
+							}
+							if condType == "Progressing" {
+								progressing = condStatus
+							}
+							if condType == "Degraded" {
+								degraded = condStatus
+							}
+						}
+
+						fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s %-15s\n", name, version, available, progressing, degraded)
+					} else if res.name == "clusterversions" {
+						version, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "desired", "version")
+						if version == "" {
+							// Try history if desired is empty
+							if history, found, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "history"); found && len(history) > 0 {
+								if last, ok := history[0].(map[string]interface{}); ok {
+									version, _, _ = unstructuredhelpers.NestedString(last, "version")
+								}
+							}
+						}
+						
 						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
 						available := "Unknown"
 						progressing := "Unknown"
@@ -332,33 +385,13 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 						if version == "" {
 							version = "<none>"
 						}
-						fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s\n", name, version, available, progressing)
-					} else if res.name == "clusterversions" {
-						version, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "desired", "version")
-						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
-						available := "Unknown"
-
-						for _, cond := range conditions {
-							condMap, ok := cond.(map[string]interface{})
-							if !ok {
-								continue
-							}
-							condType, _, _ := unstructuredhelpers.NestedString(condMap, "type")
-							condStatus, _, _ := unstructuredhelpers.NestedString(condMap, "status")
-							if condType == "Available" {
-								available = condStatus
-							}
-						}
-
-						if version == "" {
-							version = "<none>"
-						}
-						fmt.Fprintf(&output, "%-20s %-30s %-15s\n", name, version, available)
+						fmt.Fprintf(&output, "%-20s %-30s %-15s %-15s\n", name, version, available, progressing)
 					} else if res.name == "machineconfigpools" {
 						config, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "configuration", "name")
 						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
 						updated := "False"
 						updating := "False"
+						degraded := "False"
 
 						for _, cond := range conditions {
 							condMap, ok := cond.(map[string]interface{})
@@ -367,18 +400,24 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 							}
 							condType, _, _ := unstructuredhelpers.NestedString(condMap, "type")
 							condStatus, _, _ := unstructuredhelpers.NestedString(condMap, "status")
-							if condType == "Updated" && condStatus == "True" {
-								updated = "True"
-							}
-							if condType == "Updating" && condStatus == "True" {
-								updating = "True"
+							
+							if condStatus == "True" {
+								if condType == "Updated" {
+									updated = "True"
+								}
+								if condType == "Updating" {
+									updating = "True"
+								}
+								if condType == "Degraded" {
+									degraded = "True"
+								}
 							}
 						}
 
 						if config == "" {
 							config = "<none>"
 						}
-						fmt.Fprintf(&output, "%-30s %-15s %-15s %-15s\n", name, config, updated, updating)
+						fmt.Fprintf(&output, "%-30s %-20s %-10s %-10s %-10s\n", name, config, updated, updating, degraded)
 					}
 				}
 			}

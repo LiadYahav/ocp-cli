@@ -603,15 +603,6 @@ func getPodReady(pod *corev1.Pod) string {
 	return fmt.Sprintf("%d/%d", ready, total)
 }
 
-// getPodRestarts returns the total number of restarts across all containers
-func getPodRestarts(pod *corev1.Pod) string {
-	totalRestarts := int32(0)
-	for _, containerStatus := range pod.Status.ContainerStatuses {
-		totalRestarts += containerStatus.RestartCount
-	}
-	return fmt.Sprintf("%d", totalRestarts)
-}
-
 // findNodeByName finds a node by exact name match
 func findNodeByName(ctx context.Context, nodeName string) (*corev1.Node, error) {
 	clientset, err := kube.NewClientset(ctx)
@@ -625,26 +616,4 @@ func findNodeByName(ctx context.Context, nodeName string) (*corev1.Node, error) 
 	}
 
 	return node, nil
-}
-
-// formatAge returns a human-readable age string
-func formatAge(t time.Time) string {
-	duration := time.Since(t)
-
-	days := int(duration.Hours() / 24)
-	if days > 0 {
-		return fmt.Sprintf("%dd", days)
-	}
-
-	hours := int(duration.Hours())
-	if hours > 0 {
-		return fmt.Sprintf("%dh", hours)
-	}
-
-	minutes := int(duration.Minutes())
-	if minutes > 0 {
-		return fmt.Sprintf("%dm", minutes)
-	}
-
-	return fmt.Sprintf("%ds", int(duration.Seconds()))
 }

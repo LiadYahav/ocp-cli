@@ -10,7 +10,22 @@ The following commands and their implementations are based on patterns and conce
 from Kubernetes kubectl and OpenShift CLI:
 - get, create, edit, delete, describe, logs, apply, patch (kubectl-like commands)
 - annotate, label (resource annotation and labeling)
+- Table printing formats and column layouts for resource display (matching kubectl/oc output)
 - All resource management operations follow kubectl patterns and conventions
+
+**Diagnostics:**
+The diagnostics command suite provides health check capabilities for cluster components,
+leveraging SSH access for deep inspection of node metrics and services.
+
+**Table Printing:**
+Table output formats for the following resources are designed to match kubectl/oc behavior:
+- Pods, Deployments, ReplicaSets, StatefulSets, DaemonSets
+- Jobs, CronJobs
+- Services, Secrets, ConfigMaps, ServiceAccounts
+- Nodes, Namespaces
+- Machine Config Pools (OpenShift)
+- Routes (OpenShift)
+- Wide output (-owide) implementations following kubectl patterns
 
 This product includes support for OpenShift-specific Custom Resource Definitions (CRDs)
 and resources, including but not limited to:
@@ -53,3 +68,9 @@ or `ocp get crd` instead of `ocp get customresourcedefinitions`. All standard Ku
 and OpenShift resource shortcuts are supported (e.g., `po` for pods, `svc` for services,
 `deploy` for deployments, `co` for clusteroperators, `cv` for clusterversions, etc.).
 These aliases are automatically resolved during resource discovery.
+
+**clearyml Command:**
+The clearyml command implementation follows kubectl/oc patterns for resource retrieval
+and YAML output, but includes custom logic for cleaning/sanitizing YAML output by
+removing status fields, managed fields, resource versions, and other runtime-generated
+metadata. This makes the output suitable for version control and re-application to clusters.

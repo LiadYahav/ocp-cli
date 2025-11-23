@@ -1,8 +1,8 @@
 module github.com/liadyahav/ocp-cli
 
-go 1.24.0
+go 1.25.3
 
-toolchain go1.24.3
+toolchain go1.25.3
 
 require (
 	github.com/spf13/cobra v1.10.1
@@ -35,7 +35,7 @@ require (
 	github.com/spf13/pflag v1.0.9 // indirect
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/oauth2 v0.10.0 // indirect
-	golang.org/x/sync v0.18.0 // indirect
+	golang.org/x/sync v0.17.0
 	golang.org/x/sys v0.13.0 // indirect
 	golang.org/x/term v0.13.0 // indirect
 	golang.org/x/text v0.13.0 // indirect

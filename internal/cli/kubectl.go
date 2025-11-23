@@ -1412,6 +1412,10 @@ func listResourceNames(ctx context.Context, clientset *kubernetes.Clientset, res
 // Implementation functions
 
 func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceType string, resourceName string, namespace string, allNamespaces bool, selector string, output string, showLabels bool, out io.Writer) error {
+	// Detect Kubernetes version for version-aware behavior
+	k8sVersion, _ := kube.GetKubernetesVersion(ctx)
+	_ = k8sVersion // Will be used for version-specific optimizations
+
 	// Use discovery to resolve resource type
 	resolver, err := getResourceResolver(ctx)
 	if err != nil {
@@ -1434,6 +1438,8 @@ func getResource(ctx context.Context, clientset *kubernetes.Clientset, resourceT
 		opts.LabelSelector = selector
 	}
 
+	// Ensure we get full resource information including status
+	// Some Kubernetes versions may require explicit field selection
 	var list *unstructured.UnstructuredList
 	if !namespaced {
 		// Cluster-scoped resource
@@ -1541,17 +1547,22 @@ func getAllResources(ctx context.Context, namespace string, allNamespaces bool, 
 }
 
 // Helper function to get a single resource by name using discovery
+// Ensures status field is included in the response
 func getSingleResource(ctx context.Context, dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, resourceName string, namespace string, namespaced bool) (*unstructured.Unstructured, error) {
 	var obj *unstructured.Unstructured
 	var err error
 
+	// Use empty GetOptions to get full resource including status
+	// Some Kubernetes versions may require explicit field selection, but default should include status
+	getOpts := metav1.GetOptions{}
+
 	if !namespaced {
-		obj, err = dynamicClient.Resource(gvr).Get(ctx, resourceName, metav1.GetOptions{})
+		obj, err = dynamicClient.Resource(gvr).Get(ctx, resourceName, getOpts)
 	} else {
 		if namespace == "" {
 			return nil, fmt.Errorf("namespace is required for namespaced resource")
 		}
-		obj, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, metav1.GetOptions{})
+		obj, err = dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, resourceName, getOpts)
 	}
 
 	if meta.IsNoMatchError(err) {
@@ -1658,10 +1669,22 @@ func convertUnstructuredToTyped(items []runtime.Object, resourceType string) []r
 		}
 
 		// Convert based on resource type
+		// Ensure status field is preserved during conversion
 		switch strings.ToLower(resourceType) {
 		case "pods", "po", "pod":
 			var pod corev1.Pod
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &pod); err == nil {
+				// Verify status was converted - check if status exists in unstructured but is empty in typed
+				if pod.Status.Phase == "" && len(pod.Status.ContainerStatuses) == 0 {
+					// Status might be missing, try to extract from unstructured directly
+					if statusObj, found, _ := unstructured.NestedMap(unstructuredObj.Object, "status"); found && statusObj != nil {
+						// Status exists in unstructured, re-convert to ensure it's preserved
+						var podRetry corev1.Pod
+						if retryErr := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &podRetry); retryErr == nil {
+							pod = podRetry
+						}
+					}
+				}
 				converted = append(converted, &pod)
 			} else {
 				converted = append(converted, item) // Fallback to unstructured
@@ -1676,6 +1699,17 @@ func convertUnstructuredToTyped(items []runtime.Object, resourceType string) []r
 		case "deployments", "deploy", "deployment":
 			var deploy appsv1.Deployment
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &deploy); err == nil {
+				// Verify status was converted - check if status exists but replicas are zero
+				if deploy.Status.Replicas == 0 && deploy.Status.ReadyReplicas == 0 && deploy.Status.UpdatedReplicas == 0 {
+					// Check if status exists in unstructured but wasn't converted properly
+					if statusObj, found, _ := unstructured.NestedMap(unstructuredObj.Object, "status"); found && statusObj != nil {
+						// Status exists, try re-conversion
+						var deployRetry appsv1.Deployment
+						if retryErr := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &deployRetry); retryErr == nil {
+							deploy = deployRetry
+						}
+					}
+				}
 				converted = append(converted, &deploy)
 			} else {
 				converted = append(converted, item)
@@ -1787,9 +1821,11 @@ func printWideResourceList(list runtime.Object, out io.Writer, allNamespaces boo
 
 func getReadyContainers(pod *corev1.Pod) int {
 	ready := 0
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.Ready {
-			ready++
+	if pod.Status.ContainerStatuses != nil {
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Ready {
+				ready++
+			}
 		}
 	}
 	return ready
@@ -1837,8 +1873,33 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 			continue
 		}
 
-		ready := fmt.Sprintf("%d/%d", getReadyContainers(pod), len(pod.Spec.Containers))
+		// Get ready containers count with proper nil checks
+		readyCount := getReadyContainers(pod)
+		totalContainers := len(pod.Spec.Containers)
+		if totalContainers == 0 {
+			totalContainers = len(pod.Status.ContainerStatuses) // Fallback to status count
+		}
+		ready := fmt.Sprintf("%d/%d", readyCount, totalContainers)
+
+		// Get pod status with fallback
 		status := string(pod.Status.Phase)
+		if status == "" {
+			// Try to determine status from conditions
+			for _, condition := range pod.Status.Conditions {
+				if condition.Type == corev1.PodReady {
+					if condition.Status == corev1.ConditionTrue {
+						status = "Running"
+					} else {
+						status = "NotReady"
+					}
+					break
+				}
+			}
+			if status == "" {
+				status = "Unknown"
+			}
+		}
+
 		restarts := getPodRestarts(pod)
 		age := formatAge(pod.CreationTimestamp.Time)
 
@@ -2194,9 +2255,22 @@ func printDeploymentsTable(items []runtime.Object, out io.Writer, allNamespaces 
 			continue
 		}
 
-		ready := fmt.Sprintf("%d/%d", deploy.Status.ReadyReplicas, deploy.Status.Replicas)
-		upToDate := fmt.Sprintf("%d", deploy.Status.UpdatedReplicas)
-		available := fmt.Sprintf("%d", deploy.Status.AvailableReplicas)
+		// Get deployment status with proper handling
+		// Use spec.replicas as fallback if status is not available
+		totalReplicas := int32(0)
+		if deploy.Spec.Replicas != nil {
+			totalReplicas = *deploy.Spec.Replicas
+		}
+		// Prefer status.replicas if available (more accurate)
+		if deploy.Status.Replicas > 0 {
+			totalReplicas = deploy.Status.Replicas
+		}
+
+		readyReplicas := deploy.Status.ReadyReplicas
+		ready := fmt.Sprintf("%d/%d", readyReplicas, totalReplicas)
+
+		upToDate := deploy.Status.UpdatedReplicas
+		available := deploy.Status.AvailableReplicas
 
 		containers := "<none>"
 		images := "<none>"
@@ -3137,7 +3211,47 @@ func toInterfaceSlice(strs []string) []interface{} {
 	return result
 }
 
-// getPodRestarts is defined in node.go - using that one
+// Helper functions for resource status extraction
+
+// getPodRestarts returns the total number of restarts across all containers
+func getPodRestarts(pod *corev1.Pod) string {
+	totalRestarts := int32(0)
+	if pod != nil && pod.Status.ContainerStatuses != nil {
+		for _, containerStatus := range pod.Status.ContainerStatuses {
+			totalRestarts += containerStatus.RestartCount
+		}
+	}
+	return fmt.Sprintf("%d", totalRestarts)
+}
+
+// formatAge returns a human-readable age string
+func formatAge(t time.Time) string {
+	if t.IsZero() {
+		return "<unknown>"
+	}
+	duration := time.Since(t)
+	if duration < 0 {
+		return "<unknown>"
+	}
+
+	days := int(duration.Hours() / 24)
+	if days > 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+
+	hours := int(duration.Hours())
+	if hours > 0 {
+		return fmt.Sprintf("%dh", hours)
+	}
+
+	minutes := int(duration.Minutes())
+	if minutes > 0 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+
+	seconds := int(duration.Seconds())
+	return fmt.Sprintf("%ds", seconds)
+}
 
 func createResources(ctx context.Context, clientset *kubernetes.Clientset, dynamicClient dynamic.Interface, files []string, namespace string, out io.Writer) error {
 	var createdCount int

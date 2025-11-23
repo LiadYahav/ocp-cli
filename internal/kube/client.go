@@ -3,12 +3,20 @@ package kube
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 
+	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+)
+
+var (
+	versionCache     = make(map[string]*version.Info)
+	versionCacheMu   sync.RWMutex
 )
 
 type configPathKey struct{}
@@ -160,4 +168,68 @@ func GetCurrentContext(ctx context.Context) (contextName, clusterName string, er
 
 	clusterName = currentContext.Cluster
 	return contextName, clusterName, nil
+}
+
+// GetServerVersion returns the Kubernetes server version, with caching
+func GetServerVersion(ctx context.Context) (*version.Info, error) {
+	// Generate cache key from context
+	cacheKey := ""
+	if configPath := configPathFromContext(ctx); configPath != "" {
+		cacheKey = configPath
+	} else {
+		cfg, err := GetConfig(ctx)
+		if err == nil && cfg.Host != "" {
+			cacheKey = cfg.Host
+		}
+	}
+	if cacheKey == "" {
+		cacheKey = "default"
+	}
+
+	// Check cache
+	versionCacheMu.RLock()
+	if cached, ok := versionCache[cacheKey]; ok {
+		versionCacheMu.RUnlock()
+		return cached, nil
+	}
+	versionCacheMu.RUnlock()
+
+	// Fetch version
+	clientset, err := NewClientset(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %w", err)
+	}
+
+	serverVersion, err := clientset.Discovery().ServerVersion()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get server version: %w", err)
+	}
+
+	// Cache it
+	versionCacheMu.Lock()
+	versionCache[cacheKey] = serverVersion
+	versionCacheMu.Unlock()
+
+	return serverVersion, nil
+}
+
+// GetKubernetesVersion returns the major.minor version string (e.g., "1.28")
+func GetKubernetesVersion(ctx context.Context) (string, error) {
+	version, err := GetServerVersion(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// Extract major.minor from GitVersion (e.g., "v1.28.0" -> "1.28")
+	gitVersion := version.GitVersion
+	if len(gitVersion) > 0 && gitVersion[0] == 'v' {
+		gitVersion = gitVersion[1:]
+	}
+
+	parts := strings.Split(gitVersion, ".")
+	if len(parts) >= 2 {
+		return fmt.Sprintf("%s.%s", parts[0], parts[1]), nil
+	}
+
+	return "", fmt.Errorf("unable to parse version: %s", version.GitVersion)
 }

@@ -103,37 +103,84 @@ func newNodeRebootCommand() *cobra.Command {
 	var user string
 	var identityFile string
 	var maxRetries int
+	var maxConcurrency int
+	var skipDrain bool
+	var confirm bool
 
 	cmd := &cobra.Command{
 		Use:               "reboot <node-name>",
 		ValidArgsFunction: completeNodeNames,
-		Short:             "Reboot a node via SSH",
-		Long: `Reboot a node by SSHing into it and running 'sudo reboot'.
-This command connects to the specified node by name and executes the reboot command.
+		Short:             "Reboot a node via SSH (drains first)",
+		Long: `Reboot a node by first draining it (cordoning and evicting pods), then SSHing into it and running 'sudo reboot'.
+
+The command will:
+1. Cordon the node (mark as unschedulable)
+2. Evict all non-DaemonSet pods from the node
+3. If drain succeeds, execute 'sudo reboot' via SSH
+4. If drain fails, abort the reboot and leave the node cordoned
+
+**WARNING**: This is a destructive operation. Use --confirm to proceed without prompting.
+Use --skip-drain to reboot without draining (not recommended for production).
 
 The command will automatically retry failed SSH connections (default: 3 retries).
 Use --max-retries to customize the number of retry attempts.`,
 		Args: cobra.ExactArgs(1),
-		Example: `  # Reboot a specific node
-  ocp node reboot worker-2
+		Example: `  # Reboot a specific node (drains first)
+  ocp node reboot worker-2 --confirm
 
   # Reboot with custom retry count
-  ocp node reboot worker-2 --max-retries 5`,
+  ocp node reboot worker-2 --max-retries 5 --confirm
+
+  # Reboot without draining (not recommended)
+  ocp node reboot worker-2 --skip-drain --confirm
+
+  # Reboot with higher eviction concurrency
+  ocp node reboot worker-2 --max-concurrency 10 --confirm`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nodeName := args[0]
+			ctx := ensureContext(cmd.Context())
+
+			// Require confirmation for destructive operation
+			if !confirm {
+				fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: This will drain and reboot node %q\n", nodeName)
+				fmt.Fprintf(cmd.ErrOrStderr(), "Use --confirm to proceed without this prompt\n")
+				return fmt.Errorf("confirmation required for destructive operation. Use --confirm to proceed")
+			}
 
 			// Use retry logic for SSH commands
 			if maxRetries <= 0 {
 				maxRetries = 3
 			}
+			if maxConcurrency <= 0 {
+				maxConcurrency = 5
+			}
+
+			// Drain the node first (unless --skip-drain is specified)
+			if !skipDrain {
+				fmt.Fprintf(cmd.OutOrStdout(), "Draining node %s before reboot...\n", nodeName)
+
+				if err := drainNode(ctx, nodeName, maxConcurrency, cmd); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "\n✗ Drain failed for node %s: %v\n", nodeName, err)
+					fmt.Fprintf(cmd.ErrOrStderr(), "Reboot aborted. Node %s is still cordoned.\n", nodeName)
+					fmt.Fprintf(cmd.ErrOrStderr(), "To uncordon the node, run: ocp node uncordon %s\n", nodeName)
+					return fmt.Errorf("reboot aborted: drain failed for node %s", nodeName)
+				}
+
+				fmt.Fprintf(cmd.OutOrStdout(), "\n✓ Node %s drained successfully\n", nodeName)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "Skipping drain (--skip-drain specified)\n")
+			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "Rebooting node %s...\n", nodeName)
-			err := runSSHCommandWithRetry(cmd.Context(), user, identityFile, nodeName, []string{"sudo reboot"}, cmd, maxRetries, time.Second)
+			err := runSSHCommandWithRetry(ctx, user, identityFile, nodeName, []string{"sudo reboot"}, cmd, maxRetries, time.Second)
 			if err != nil {
 				return fmt.Errorf("failed to reboot node %s: %w", nodeName, err)
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Reboot command sent successfully to node %s\n", nodeName)
+			fmt.Fprintf(cmd.OutOrStdout(), "✓ Reboot command sent successfully to node %s\n", nodeName)
+			if !skipDrain {
+				fmt.Fprintf(cmd.OutOrStdout(), "Note: Node will remain cordoned after reboot. Run 'ocp node uncordon %s' when ready.\n", nodeName)
+			}
 			return nil
 		},
 	}
@@ -141,6 +188,9 @@ Use --max-retries to customize the number of retry attempts.`,
 	cmd.Flags().StringVarP(&user, "user", "u", "core", "Username for SSH connection")
 	cmd.Flags().StringVarP(&identityFile, "identity", "i", "", "Path to private key file for SSH authentication (default: ~/.ssh/id_rsa_ocp if exists)")
 	cmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Maximum number of retry attempts for SSH connection")
+	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 5, "Maximum number of concurrent pod evictions during drain")
+	cmd.Flags().BoolVar(&skipDrain, "skip-drain", false, "Skip draining the node before reboot (not recommended)")
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm destructive operation without prompting")
 
 	return cmd
 }
@@ -182,13 +232,13 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 				node.Annotations[maintenanceAnnotationKey] = maintenanceAnnotationValue
 				needsUpdate = true
 			}
-			
+
 			// Cordon the node
 			if !node.Spec.Unschedulable {
 				node.Spec.Unschedulable = true
 				needsUpdate = true
 			}
-			
+
 			if needsUpdate {
 				_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 				if err != nil {
@@ -201,7 +251,7 @@ The command will automatically add the annotation "node.dana.io/reason: Maintena
 			} else {
 				fmt.Fprintf(cmd.OutOrStdout(), "Node %q is already unschedulable\n", node.Name)
 			}
-			
+
 			return nil
 		},
 	}
@@ -234,7 +284,7 @@ to control the number of concurrent evictions (default: 5).`,
 			nodeName := args[0]
 
 			ctx := ensureContext(cmd.Context())
-			
+
 			// Require confirmation for destructive operation
 			if !confirm {
 				fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: This will evict all pods from node %q\n", nodeName)
@@ -261,13 +311,13 @@ to control the number of concurrent evictions (default: 5).`,
 				node.Annotations[maintenanceAnnotationKey] = maintenanceAnnotationValue
 				needsUpdate = true
 			}
-			
+
 			// Cordon the node
 			if !node.Spec.Unschedulable {
 				node.Spec.Unschedulable = true
 				needsUpdate = true
 			}
-			
+
 			if needsUpdate {
 				_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 				if err != nil {
@@ -405,6 +455,164 @@ to control the number of concurrent evictions (default: 5).`,
 	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm destructive operation without prompting")
 
 	return cmd
+}
+
+// drainNode is a helper function that drains a node (cordon + evict pods)
+// It returns an error if the drain fails
+func drainNode(ctx context.Context, nodeName string, maxConcurrency int, cmd *cobra.Command) error {
+	node, err := findNodeByName(ctx, nodeName)
+	if err != nil {
+		return err
+	}
+
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes client: %w", err)
+	}
+
+	// Add maintenance annotation if it doesn't exist and cordon in a single update
+	needsUpdate := false
+	if node.Annotations == nil {
+		node.Annotations = make(map[string]string)
+	}
+	if node.Annotations[maintenanceAnnotationKey] != maintenanceAnnotationValue {
+		node.Annotations[maintenanceAnnotationKey] = maintenanceAnnotationValue
+		needsUpdate = true
+	}
+
+	// Cordon the node
+	if !node.Spec.Unschedulable {
+		node.Spec.Unschedulable = true
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to update node %q: %w", node.Name, err)
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "✓ Cordoned node %q\n", node.Name)
+	}
+
+	// Evict all pods
+	pods, err := clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods on node %q: %w", node.Name, err)
+	}
+
+	// Filter out DaemonSet pods first
+	type podToEvict struct {
+		namespace string
+		name      string
+	}
+	var podsToEvict []podToEvict
+	var skippedCount int
+
+	for _, pod := range pods.Items {
+		// Skip DaemonSet pods
+		if pod.OwnerReferences != nil {
+			isDaemonSet := false
+			for _, ref := range pod.OwnerReferences {
+				if ref.Kind == "DaemonSet" {
+					isDaemonSet = true
+					break
+				}
+			}
+			if isDaemonSet {
+				fmt.Fprintf(cmd.OutOrStdout(), "⊘ Skipping DaemonSet pod %s/%s\n", pod.Namespace, pod.Name)
+				skippedCount++
+				continue
+			}
+		}
+		podsToEvict = append(podsToEvict, podToEvict{namespace: pod.Namespace, name: pod.Name})
+	}
+
+	if len(podsToEvict) == 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "No pods to evict (excluding DaemonSets)\n")
+		return nil
+	}
+
+	// Use worker pool pattern for concurrent evictions
+	type evictionResult struct {
+		podNamespace string
+		podName      string
+		err          error
+	}
+
+	podChan := make(chan podToEvict, len(podsToEvict))
+	resultChan := make(chan evictionResult, len(podsToEvict))
+
+	// Send all pods to evict to the channel
+	for _, pod := range podsToEvict {
+		podChan <- pod
+	}
+	close(podChan)
+
+	// Start worker goroutines
+	var wg sync.WaitGroup
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pod := range podChan {
+				eviction := &policyv1.Eviction{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      pod.name,
+						Namespace: pod.namespace,
+					},
+				}
+
+				err := clientset.CoreV1().Pods(pod.namespace).EvictV1(ctx, eviction)
+				resultChan <- evictionResult{
+					podNamespace: pod.namespace,
+					podName:      pod.name,
+					err:          err,
+				}
+			}
+		}()
+	}
+
+	// Wait for all workers to finish
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	var evictedCount int
+	var failedCount int
+	var failedPods []string
+
+	for result := range resultChan {
+		if result.err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "✗ Failed to evict pod %s/%s: %v\n", result.podNamespace, result.podName, result.err)
+			failedCount++
+			failedPods = append(failedPods, fmt.Sprintf("%s/%s", result.podNamespace, result.podName))
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "✓ Evicted pod %s/%s\n", result.podNamespace, result.podName)
+			evictedCount++
+		}
+	}
+
+	// Print summary
+	fmt.Fprintf(cmd.OutOrStdout(), "\n=== Drain Summary ===\n")
+	fmt.Fprintf(cmd.OutOrStdout(), "Node: %s\n", node.Name)
+	fmt.Fprintf(cmd.OutOrStdout(), "Total pods found: %d\n", len(pods.Items))
+	fmt.Fprintf(cmd.OutOrStdout(), "Pods evicted: %d\n", evictedCount)
+	fmt.Fprintf(cmd.OutOrStdout(), "Pods skipped (DaemonSet): %d\n", skippedCount)
+	fmt.Fprintf(cmd.OutOrStdout(), "Pods failed to evict: %d\n", failedCount)
+
+	if failedCount > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(), "\n✗ Failed to evict pods:\n")
+		for _, podName := range failedPods {
+			fmt.Fprintf(cmd.ErrOrStderr(), "  - %s\n", podName)
+		}
+		return fmt.Errorf("drain failed: %d pod eviction(s) failed", failedCount)
+	}
+
+	return nil
 }
 
 func newNodeUncordonCommand() *cobra.Command {

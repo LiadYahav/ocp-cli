@@ -297,11 +297,11 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 
 				// Print table header
 				if res.name == "clusteroperators" {
-					fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s %-15s\n", "NAME", "VERSION", "AVAILABLE", "PROGRESSING", "DEGRADED")
+					fmt.Fprintf(&output, "%-50s %-15s %-12s %-12s %-12s\n", "NAME", "VERSION", "AVAILABLE", "PROGRESSING", "DEGRADED")
 				} else if res.name == "clusterversions" {
-					fmt.Fprintf(&output, "%-20s %-30s %-15s\n", "NAME", "VERSION", "AVAILABLE")
+					fmt.Fprintf(&output, "%-20s %-30s %-12s %-12s\n", "NAME", "VERSION", "AVAILABLE", "PROGRESSING")
 				} else if res.name == "machineconfigpools" {
-					fmt.Fprintf(&output, "%-30s %-20s %-10s %-10s %-10s\n", "NAME", "CONFIG", "UPDATED", "UPDATING", "DEGRADED")
+					fmt.Fprintf(&output, "%-25s %-50s %-10s %-10s %-10s\n", "NAME", "CONFIG", "UPDATED", "UPDATING", "DEGRADED")
 				}
 
 				// Print each item
@@ -351,7 +351,7 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 							}
 						}
 
-						fmt.Fprintf(&output, "%-50s %-15s %-15s %-15s %-15s\n", name, version, available, progressing, degraded)
+						fmt.Fprintf(&output, "%-50s %-15s %-12s %-12s %-12s\n", name, version, available, progressing, degraded)
 					} else if res.name == "clusterversions" {
 						version, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "desired", "version")
 						if version == "" {
@@ -382,10 +382,10 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 							}
 						}
 
-						if version == "" {
-							version = "<none>"
-						}
-						fmt.Fprintf(&output, "%-20s %-30s %-15s %-15s\n", name, version, available, progressing)
+					if version == "" {
+						version = "<none>"
+					}
+						fmt.Fprintf(&output, "%-20s %-30s %-12s %-12s\n", name, version, available, progressing)
 					} else if res.name == "machineconfigpools" {
 						config, _, _ := unstructuredhelpers.NestedString(item.Object, "status", "configuration", "name")
 						conditions, _, _ := unstructuredhelpers.NestedSlice(item.Object, "status", "conditions")
@@ -414,10 +414,10 @@ func watchClusterResources(ctx context.Context, out io.Writer) error {
 							}
 						}
 
-						if config == "" {
-							config = "<none>"
-						}
-						fmt.Fprintf(&output, "%-30s %-20s %-10s %-10s %-10s\n", name, config, updated, updating, degraded)
+					if config == "" {
+						config = "<none>"
+					}
+						fmt.Fprintf(&output, "%-25s %-50s %-10s %-10s %-10s\n", name, config, updated, updating, degraded)
 					}
 				}
 			}
@@ -603,6 +603,8 @@ func newClusterConfigureDNSCommand() *cobra.Command {
 	var maxConcurrency int
 	var maxRetries int
 	var confirm bool
+	var resolveDomain string
+	var skipValidation bool
 
 	cmd := &cobra.Command{
 		Use:   "configure-dns <nameservers>",
@@ -621,7 +623,13 @@ Use --confirm to proceed without prompting.`,
   ocp cluster configure-dns 8.8.8.8,8.8.4.4
 
   # Configure with custom concurrency and retries
-  ocp cluster configure-dns 8.8.8.8 --max-concurrency 10 --max-retries 5`,
+  ocp cluster configure-dns 8.8.8.8 --max-concurrency 10 --max-retries 5
+
+  # Validate nameserver by resolving a specific domain instead of example.com
+  ocp cluster configure-dns 10.0.0.1 --resolve-domain mycompany.local
+
+  # Skip nameserver validation entirely
+  ocp cluster configure-dns 10.0.0.1 --skip-validation`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := ensureContext(cmd.Context())
@@ -643,8 +651,14 @@ Use --confirm to proceed without prompting.`,
 				return formatErrorWithContext(err, "parseNameservers", "", "", "")
 			}
 
-			if err := validateNameservers(opCtx, nameservers); err != nil {
-				return formatErrorWithContext(err, "validateNameservers", "", "", "")
+			if !skipValidation {
+				domain := "example.com"
+				if resolveDomain != "" {
+					domain = resolveDomain
+				}
+				if err := validateNameserversWithDomain(opCtx, nameservers, domain); err != nil {
+					return formatErrorWithContext(err, "validateNameservers", "", "", "")
+				}
 			}
 
 			clientset, err := kube.NewClientset(opCtx)
@@ -750,6 +764,8 @@ Use --confirm to proceed without prompting.`,
 	cmd.Flags().IntVar(&maxConcurrency, "max-concurrency", 10, "Maximum number of concurrent SSH connections")
 	cmd.Flags().IntVar(&maxRetries, "max-retries", 3, "Maximum number of retry attempts per node")
 	cmd.Flags().BoolVar(&confirm, "confirm", false, "Confirm destructive operation without prompting")
+	cmd.Flags().StringVar(&resolveDomain, "resolve-domain", "", "Domain to resolve when validating nameservers (default: example.com)")
+	cmd.Flags().BoolVar(&skipValidation, "skip-validation", false, "Skip nameserver validation (use with caution)")
 
 	return cmd
 }
@@ -828,13 +844,17 @@ func parseNameservers(arg string) ([]string, error) {
 }
 
 func validateNameservers(ctx context.Context, nameservers []string) error {
+	return validateNameserversWithDomain(ctx, nameservers, "example.com")
+}
+
+func validateNameserversWithDomain(ctx context.Context, nameservers []string, domain string) error {
 	for _, ns := range nameservers {
 		if ip := net.ParseIP(ns); ip == nil {
 			return fmt.Errorf("invalid nameserver IP: %s", ns)
 		}
 
-		if err := queryNameserver(ctx, ns); err != nil {
-			return fmt.Errorf("nameserver %s failed validation: %w", ns, err)
+		if err := queryNameserverWithDomain(ctx, ns, domain); err != nil {
+			return fmt.Errorf("nameserver %s failed validation (resolving %s): %w", ns, domain, err)
 		}
 	}
 
@@ -842,10 +862,14 @@ func validateNameservers(ctx context.Context, nameservers []string) error {
 }
 
 func queryNameserver(ctx context.Context, nameserver string) error {
+	return queryNameserverWithDomain(ctx, nameserver, "example.com")
+}
+
+func queryNameserverWithDomain(ctx context.Context, nameserver, domain string) error {
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(lookupCtx, "nslookup", "example.com", nameserver)
+	cmd := exec.CommandContext(lookupCtx, "nslookup", domain, nameserver)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("nslookup failed: %w", err)
 	}

@@ -33,6 +33,7 @@ func newDiagnoseNodeCommand() *cobra.Command {
 		Use:   "node [node-name]",
 		Short: "Check node health metrics (CPU, Disk, Services)",
 		Args:  cobra.MaximumNArgs(1),
+		ValidArgsFunction: completeNodeNames,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			
@@ -104,6 +105,13 @@ func newDiagnosePodCommand() *cobra.Command {
 		Use:   "pod <pod-name>",
 		Short: "Check pod health (status, restarts, events, logs)",
 		Args:  cobra.ExactArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) != 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			// Use the existing completeResourceNames function for pods
+			return completeResourceNames(cmd, "pods", toComplete, namespace, false)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			podName := args[0]

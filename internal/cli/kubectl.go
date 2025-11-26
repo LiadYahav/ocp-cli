@@ -2017,75 +2017,143 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 
 	// First pass: collect data and calculate widths
 	for _, item := range items {
-		pod, ok := item.(*corev1.Pod)
-		if !ok {
-			continue
-		}
+		var data podData
+		
+		switch p := item.(type) {
+		case *corev1.Pod:
+			// Get ready containers count with proper nil checks
+			readyCount := getReadyContainers(p)
+			totalContainers := len(p.Spec.Containers)
+			if totalContainers == 0 {
+				totalContainers = len(p.Status.ContainerStatuses) // Fallback to status count
+			}
+			data.ready = fmt.Sprintf("%d/%d", readyCount, totalContainers)
 
-		// Get ready containers count with proper nil checks
-		readyCount := getReadyContainers(pod)
-		totalContainers := len(pod.Spec.Containers)
-		if totalContainers == 0 {
-			totalContainers = len(pod.Status.ContainerStatuses) // Fallback to status count
-		}
-		ready := fmt.Sprintf("%d/%d", readyCount, totalContainers)
-
-		// Get pod status with fallback
-		status := string(pod.Status.Phase)
-		if status == "" {
-			// Try to determine status from conditions
-			for _, condition := range pod.Status.Conditions {
-				if condition.Type == corev1.PodReady {
-					if condition.Status == corev1.ConditionTrue {
-						status = "Running"
-					} else {
-						status = "NotReady"
+			// Get pod status with fallback
+			data.status = string(p.Status.Phase)
+			if data.status == "" {
+				// Try to determine status from conditions
+				for _, condition := range p.Status.Conditions {
+					if condition.Type == corev1.PodReady {
+						if condition.Status == corev1.ConditionTrue {
+							data.status = "Running"
+						} else {
+							data.status = "NotReady"
+						}
+						break
 					}
-					break
+				}
+				if data.status == "" {
+					data.status = "Unknown"
 				}
 			}
-			if status == "" {
-				status = "Unknown"
-			}
-		}
 
-		restarts := getPodRestarts(pod)
-		age := formatAge(pod.CreationTimestamp.Time)
+			data.restarts = getPodRestarts(p)
+			data.age = formatAge(p.CreationTimestamp.Time)
+			data.namespace = p.Namespace
+			data.name = p.Name
 
-		data := podData{
-			namespace: pod.Namespace,
-			name:      pod.Name,
-			ready:     ready,
-			status:    status,
-			restarts:  restarts,
-			age:       age,
-		}
-
-		if wide {
-			data.node = pod.Spec.NodeName
-			if data.node == "" {
-				data.node = "<none>"
-			}
-			data.ip = pod.Status.PodIP
-			if data.ip == "" {
-				data.ip = "<none>"
-			}
-			if pod.Spec.NodeName != "" {
+			if wide {
+				data.node = p.Spec.NodeName
+				if data.node == "" {
+					data.node = "<none>"
+				}
+				data.ip = p.Status.PodIP
+				if data.ip == "" {
+					data.ip = "<none>"
+				}
 				data.nominated = "<none>"
+			}
+
+			if showLabels {
+				labelPairs := make([]string, 0, len(p.Labels))
+				for k, v := range p.Labels {
+					labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				data.labels = strings.Join(labelPairs, ",")
+				if data.labels == "" {
+					data.labels = "<none>"
+				}
+			}
+
+		case *unstructured.Unstructured:
+			// Handle unstructured pod objects
+			data.name, _, _ = unstructured.NestedString(p.Object, "metadata", "name")
+			data.namespace, _, _ = unstructured.NestedString(p.Object, "metadata", "namespace")
+			
+			// Get status phase
+			data.status, _, _ = unstructured.NestedString(p.Object, "status", "phase")
+			if data.status == "" {
+				data.status = "Unknown"
+			}
+			
+			// Get container statuses for ready count and restarts
+			containerStatuses, found, _ := unstructured.NestedSlice(p.Object, "status", "containerStatuses")
+			readyCount := 0
+			totalRestarts := int64(0)
+			totalContainers := 0
+			
+			if found {
+				totalContainers = len(containerStatuses)
+				for _, cs := range containerStatuses {
+					if csMap, ok := cs.(map[string]interface{}); ok {
+						if ready, _, _ := unstructured.NestedBool(csMap, "ready"); ready {
+							readyCount++
+						}
+						if restartCount, _, _ := unstructured.NestedInt64(csMap, "restartCount"); restartCount > 0 {
+							totalRestarts += restartCount
+						}
+					}
+				}
+			}
+			
+			// Fallback to spec.containers count
+			if totalContainers == 0 {
+				if containers, found, _ := unstructured.NestedSlice(p.Object, "spec", "containers"); found {
+					totalContainers = len(containers)
+				}
+			}
+			
+			data.ready = fmt.Sprintf("%d/%d", readyCount, totalContainers)
+			data.restarts = fmt.Sprintf("%d", totalRestarts)
+			
+			// Get age
+			if creationTimestamp, found, _ := unstructured.NestedString(p.Object, "metadata", "creationTimestamp"); found && creationTimestamp != "" {
+				if t, err := time.Parse(time.RFC3339, creationTimestamp); err == nil {
+					data.age = formatAge(t)
+				} else {
+					data.age = "<unknown>"
+				}
 			} else {
+				data.age = "<unknown>"
+			}
+			
+			if wide {
+				data.node, _, _ = unstructured.NestedString(p.Object, "spec", "nodeName")
+				if data.node == "" {
+					data.node = "<none>"
+				}
+				data.ip, _, _ = unstructured.NestedString(p.Object, "status", "podIP")
+				if data.ip == "" {
+					data.ip = "<none>"
+				}
 				data.nominated = "<none>"
 			}
-		}
 
-		if showLabels {
-			labelPairs := make([]string, 0, len(pod.Labels))
-			for k, v := range pod.Labels {
-				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			if showLabels {
+				labels, _, _ := unstructured.NestedStringMap(p.Object, "metadata", "labels")
+				labelPairs := make([]string, 0, len(labels))
+				for k, v := range labels {
+					labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+				}
+				data.labels = strings.Join(labelPairs, ",")
+				if data.labels == "" {
+					data.labels = "<none>"
+				}
 			}
-			data.labels = strings.Join(labelPairs, ",")
-			if data.labels == "" {
-				data.labels = "<none>"
-			}
+
+		default:
+			continue
 		}
 
 		podList = append(podList, data)

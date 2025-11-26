@@ -1746,23 +1746,10 @@ func convertUnstructuredToTyped(items []runtime.Object, resourceType string) []r
 		// Ensure status field is preserved during conversion
 		switch strings.ToLower(resourceType) {
 		case "pods", "po", "pod":
-			var pod corev1.Pod
-			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &pod); err == nil {
-				// Verify status was converted - check if status exists in unstructured but is empty in typed
-				if pod.Status.Phase == "" && len(pod.Status.ContainerStatuses) == 0 {
-					// Status might be missing, try to extract from unstructured directly
-					if statusObj, found, _ := unstructured.NestedMap(unstructuredObj.Object, "status"); found && statusObj != nil {
-						// Status exists in unstructured, re-convert to ensure it's preserved
-						var podRetry corev1.Pod
-						if retryErr := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &podRetry); retryErr == nil {
-							pod = podRetry
-						}
-					}
-				}
-				converted = append(converted, &pod)
-			} else {
-				converted = append(converted, item) // Fallback to unstructured
-			}
+			// For pods, always keep as unstructured to ensure reliable status extraction
+			// The printPodsTable function handles both typed and unstructured objects
+			// This avoids inconsistent conversion issues that can cause "Unknown" and "0/0" output
+			converted = append(converted, item)
 		case "services", "svc", "service":
 			var svc corev1.Service
 			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, &svc); err == nil {
@@ -2018,7 +2005,7 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 	// First pass: collect data and calculate widths
 	for _, item := range items {
 		var data podData
-		
+
 		switch p := item.(type) {
 		case *corev1.Pod:
 			// Get ready containers count with proper nil checks
@@ -2080,19 +2067,19 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 			// Handle unstructured pod objects
 			data.name, _, _ = unstructured.NestedString(p.Object, "metadata", "name")
 			data.namespace, _, _ = unstructured.NestedString(p.Object, "metadata", "namespace")
-			
+
 			// Get status phase
 			data.status, _, _ = unstructured.NestedString(p.Object, "status", "phase")
 			if data.status == "" {
 				data.status = "Unknown"
 			}
-			
+
 			// Get container statuses for ready count and restarts
 			containerStatuses, found, _ := unstructured.NestedSlice(p.Object, "status", "containerStatuses")
 			readyCount := 0
 			totalRestarts := int64(0)
 			totalContainers := 0
-			
+
 			if found {
 				totalContainers = len(containerStatuses)
 				for _, cs := range containerStatuses {
@@ -2106,17 +2093,17 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 					}
 				}
 			}
-			
+
 			// Fallback to spec.containers count
 			if totalContainers == 0 {
 				if containers, found, _ := unstructured.NestedSlice(p.Object, "spec", "containers"); found {
 					totalContainers = len(containers)
 				}
 			}
-			
+
 			data.ready = fmt.Sprintf("%d/%d", readyCount, totalContainers)
 			data.restarts = fmt.Sprintf("%d", totalRestarts)
-			
+
 			// Get age
 			if creationTimestamp, found, _ := unstructured.NestedString(p.Object, "metadata", "creationTimestamp"); found && creationTimestamp != "" {
 				if t, err := time.Parse(time.RFC3339, creationTimestamp); err == nil {
@@ -2127,7 +2114,7 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 			} else {
 				data.age = "<unknown>"
 			}
-			
+
 			if wide {
 				data.node, _, _ = unstructured.NestedString(p.Object, "spec", "nodeName")
 				if data.node == "" {

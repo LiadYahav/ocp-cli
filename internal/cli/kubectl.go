@@ -137,7 +137,7 @@ func getResourceResolver(ctx context.Context) (*resourceResolver, error) {
 		// Check if cache entry is still valid
 		if time.Since(resolver.createdAt) < cacheTTL {
 			resolverMu.RUnlock()
-			return resolver, nil
+		return resolver, nil
 		}
 		// Entry expired, remove it
 		resolverMu.RUnlock()
@@ -185,12 +185,12 @@ func (r *resourceResolver) discoverResources() ([]string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	resources := make([]string, 0, len(r.resourceCache)*2) // Estimate: plural + aliases
-	for _, info := range r.resourceCache {
-		resources = append(resources, info.resourceNames...)
+		resources := make([]string, 0, len(r.resourceCache)*2) // Estimate: plural + aliases
+		for _, info := range r.resourceCache {
+			resources = append(resources, info.resourceNames...)
+		}
+		return resources, nil
 	}
-	return resources, nil
-}
 
 // doDiscoverResources performs the actual resource discovery
 func (r *resourceResolver) doDiscoverResources() error {
@@ -1834,149 +1834,133 @@ func convertUnstructuredToTyped(items []runtime.Object, resourceType string) []r
 }
 
 func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
-	// Normalize resource type for comparison (handle singular/plural)
-	normalizedType := strings.ToLower(resourceType)
-	if strings.HasSuffix(normalizedType, "s") && len(normalizedType) > 1 {
-		// Try singular form
-		singular := normalizedType[:len(normalizedType)-1]
-		if normalizedType == "pods" || normalizedType == "services" || normalizedType == "deployments" || normalizedType == "nodes" || normalizedType == "namespaces" {
-			normalizedType = singular
-		}
+	// Always work directly with UnstructuredList to avoid conversion issues
+	uList, ok := list.(*unstructured.UnstructuredList)
+	if !ok {
+		return fmt.Errorf("unexpected list type: %T", list)
 	}
 
-	// For pods, directly use the UnstructuredList to avoid any conversion issues
-	// This is the most reliable way to ensure status data is preserved
-	if normalizedType == "pods" || normalizedType == "po" || normalizedType == "pod" {
-		if uList, ok := list.(*unstructured.UnstructuredList); ok {
-			return printPodsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
-		}
-	}
-
-	items, err := meta.ExtractList(list)
-	if err != nil {
-		return err
-	}
-	if len(items) == 0 {
+	if len(uList.Items) == 0 {
 		fmt.Fprintf(out, "No resources found.\n")
 		return nil
 	}
 
-	// Convert unstructured to typed for known resource types
-	convertedItems := convertUnstructuredToTyped(items, normalizedType)
+	// Normalize resource type for comparison
+	normalizedType := strings.ToLower(resourceType)
 
-	// Use dynamic column width calculation like ocp node info
+	// Route to appropriate table printer - all work directly with unstructured data
 	switch normalizedType {
 	case "pods", "po", "pod":
-		return printPodsTable(convertedItems, out, allNamespaces, showLabels, false)
+		return printPodsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "services", "svc", "service":
-		return printServicesTable(convertedItems, out, allNamespaces, showLabels, false)
-	case "deployments", "deploy", "deployment":
-		return printDeploymentsTable(convertedItems, out, allNamespaces, showLabels, false)
+		return printServicesTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
+	case "deployments", "deploy", "deployment", "deployments.apps":
+		return printDeploymentsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "nodes", "no", "node":
-		return printNodesTable(convertedItems, out, showLabels, false)
+		return printNodesTableFromUnstructured(uList, out, showLabels, false)
 	case "namespaces", "ns", "namespace":
-		return printNamespacesTable(convertedItems, out, showLabels, false)
+		return printNamespacesTableFromUnstructured(uList, out, showLabels, false)
 	case "secrets", "secret":
-		return printSecretsTable(items, out, allNamespaces, showLabels, false)
+		return printSecretsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "configmaps", "configmap", "cm":
-		return printConfigMapsTable(items, out, allNamespaces, showLabels, false)
+		return printConfigMapsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "serviceaccounts", "serviceaccount", "sa":
-		return printServiceAccountsTable(items, out, allNamespaces, showLabels, false)
+		return printServiceAccountsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "replicasets", "replicaset", "rs":
-		return printReplicaSetsTable(convertedItems, out, allNamespaces, showLabels, false)
+		return printReplicaSetsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "statefulsets", "statefulset", "sts":
-		return printStatefulSetsTable(convertedItems, out, allNamespaces, showLabels, false)
+		return printStatefulSetsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "daemonsets", "daemonset", "ds":
-		return printDaemonSetsTable(convertedItems, out, allNamespaces, showLabels, false)
+		return printDaemonSetsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "jobs", "job":
-		return printJobsTable(convertedItems, out, allNamespaces, showLabels, false)
+		return printJobsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "cronjobs", "cronjob", "cj":
-		return printCronJobsTable(convertedItems, out, allNamespaces, showLabels, false)
+		return printCronJobsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	case "machineconfigpools", "machineconfigpool", "mcp":
-		return printMCPTable(items, out, showLabels, false)
+		return printMCPTableFromUnstructured(uList, out, showLabels, false)
 	case "routes", "route":
-		return printRoutesTable(items, out, showLabels, allNamespaces, false)
+		return printRoutesTableFromUnstructured(uList, out, showLabels, allNamespaces, false)
+	case "persistentvolumeclaims", "persistentvolumeclaim", "pvc":
+		return printPVCTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
+	case "persistentvolumes", "persistentvolume", "pv":
+		return printPVTableFromUnstructured(uList, out, showLabels, false)
+	case "ingresses", "ingress", "ing":
+		return printIngressTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
+	case "events", "event", "ev":
+		return printEventsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
 	default:
-		// Fallback to improved simple format that extracts real status
-		return printImprovedSimpleTable(items, out, allNamespaces, showLabels, resourceType)
+		// Generic table for any resource type
+		return printGenericTableFromUnstructured(uList, out, allNamespaces, showLabels, resourceType)
 	}
 }
 
 func printWideResourceList(list runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
-	// Normalize resource type for comparison (handle singular/plural)
-	normalizedType := strings.ToLower(resourceType)
-	if strings.HasSuffix(normalizedType, "s") && len(normalizedType) > 1 {
-		// Try singular form
-		singular := normalizedType[:len(normalizedType)-1]
-		if normalizedType == "pods" || normalizedType == "services" || normalizedType == "deployments" || normalizedType == "nodes" || normalizedType == "namespaces" {
-			normalizedType = singular
-		}
+	// Always work directly with UnstructuredList to avoid conversion issues
+	uList, ok := list.(*unstructured.UnstructuredList)
+	if !ok {
+		return fmt.Errorf("unexpected list type: %T", list)
 	}
 
-	// For pods, directly use the UnstructuredList to avoid any conversion issues
-	// This is the most reliable way to ensure status data is preserved
-	if normalizedType == "pods" || normalizedType == "po" || normalizedType == "pod" {
-		if uList, ok := list.(*unstructured.UnstructuredList); ok {
-			return printPodsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
-		}
-	}
-
-	items, err := meta.ExtractList(list)
-	if err != nil {
-		return err
-	}
-	if len(items) == 0 {
+	if len(uList.Items) == 0 {
 		fmt.Fprintf(out, "No resources found.\n")
 		return nil
 	}
 
-	// Convert unstructured to typed for known resource types
-	convertedItems := convertUnstructuredToTyped(items, normalizedType)
+	// Normalize resource type for comparison
+	normalizedType := strings.ToLower(resourceType)
 
-	// Use dynamic column width calculation like ocp node info
+	// Route to appropriate table printer - all work directly with unstructured data
 	switch normalizedType {
 	case "pods", "po", "pod":
-		return printPodsTable(convertedItems, out, allNamespaces, showLabels, true)
+		return printPodsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "services", "svc", "service":
-		return printServicesTable(convertedItems, out, allNamespaces, showLabels, true)
-	case "deployments", "deploy", "deployment":
-		return printDeploymentsTable(convertedItems, out, allNamespaces, showLabels, true)
+		return printServicesTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
+	case "deployments", "deploy", "deployment", "deployments.apps":
+		return printDeploymentsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "nodes", "no", "node":
-		return printNodesTable(convertedItems, out, showLabels, true)
+		return printNodesTableFromUnstructured(uList, out, showLabels, true)
 	case "namespaces", "ns", "namespace":
-		return printNamespacesTable(convertedItems, out, showLabels, true)
+		return printNamespacesTableFromUnstructured(uList, out, showLabels, true)
 	case "secrets", "secret":
-		return printSecretsTable(items, out, allNamespaces, showLabels, true)
+		return printSecretsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "configmaps", "configmap", "cm":
-		return printConfigMapsTable(items, out, allNamespaces, showLabels, true)
+		return printConfigMapsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "serviceaccounts", "serviceaccount", "sa":
-		return printServiceAccountsTable(items, out, allNamespaces, showLabels, true)
+		return printServiceAccountsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "replicasets", "replicaset", "rs":
-		return printReplicaSetsTable(convertedItems, out, allNamespaces, showLabels, true)
+		return printReplicaSetsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "statefulsets", "statefulset", "sts":
-		return printStatefulSetsTable(convertedItems, out, allNamespaces, showLabels, true)
+		return printStatefulSetsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "daemonsets", "daemonset", "ds":
-		return printDaemonSetsTable(convertedItems, out, allNamespaces, showLabels, true)
+		return printDaemonSetsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "jobs", "job":
-		return printJobsTable(convertedItems, out, allNamespaces, showLabels, true)
+		return printJobsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "cronjobs", "cronjob", "cj":
-		return printCronJobsTable(convertedItems, out, allNamespaces, showLabels, true)
+		return printCronJobsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	case "machineconfigpools", "machineconfigpool", "mcp":
-		return printMCPTable(items, out, showLabels, true)
+		return printMCPTableFromUnstructured(uList, out, showLabels, true)
 	case "routes", "route":
-		return printRoutesTable(items, out, showLabels, allNamespaces, true)
+		return printRoutesTableFromUnstructured(uList, out, showLabels, allNamespaces, true)
+	case "persistentvolumeclaims", "persistentvolumeclaim", "pvc":
+		return printPVCTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
+	case "persistentvolumes", "persistentvolume", "pv":
+		return printPVTableFromUnstructured(uList, out, showLabels, true)
+	case "ingresses", "ingress", "ing":
+		return printIngressTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
+	case "events", "event", "ev":
+		return printEventsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
 	default:
-		// Fallback to improved simple format that extracts real status
-		return printImprovedSimpleTable(items, out, allNamespaces, showLabels, resourceType)
+		// Generic table for any resource type
+		return printGenericTableFromUnstructured(uList, out, allNamespaces, showLabels, resourceType)
 	}
 }
 
 func getReadyContainers(pod *corev1.Pod) int {
 	ready := 0
 	if pod.Status.ContainerStatuses != nil {
-		for _, status := range pod.Status.ContainerStatuses {
-			if status.Ready {
-				ready++
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Ready {
+			ready++
 			}
 		}
 	}
@@ -2198,6 +2182,1976 @@ func printPodsTableFromUnstructured(list *unstructured.UnstructuredList, out io.
 	return nil
 }
 
+// printServicesTableFromUnstructured prints services directly from UnstructuredList
+func printServicesTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type svcData struct {
+		namespace   string
+		name        string
+		svcType     string
+		clusterIP   string
+		externalIP  string
+		ports       string
+		age         string
+		selector    string
+		labels      string
+	}
+
+	var svcList []svcData
+	widths := map[string]int{
+		"namespace":  len("NAMESPACE"),
+		"name":       len("NAME"),
+		"type":       len("TYPE"),
+		"clusterip":  len("CLUSTER-IP"),
+		"externalip": len("EXTERNAL-IP"),
+		"ports":      len("PORT(S)"),
+		"age":        len("AGE"),
+	}
+	if wide {
+		widths["selector"] = len("SELECTOR")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for i := range list.Items {
+		s := &list.Items[i]
+		var data svcData
+
+		data.name, _, _ = unstructured.NestedString(s.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(s.Object, "metadata", "namespace")
+		data.svcType, _, _ = unstructured.NestedString(s.Object, "spec", "type")
+		if data.svcType == "" {
+			data.svcType = "ClusterIP"
+		}
+		data.clusterIP, _, _ = unstructured.NestedString(s.Object, "spec", "clusterIP")
+		if data.clusterIP == "" {
+			data.clusterIP = "<none>"
+		}
+
+		// External IPs
+		externalIPs, _, _ := unstructured.NestedStringSlice(s.Object, "spec", "externalIPs")
+		if len(externalIPs) > 0 {
+			data.externalIP = strings.Join(externalIPs, ",")
+		} else {
+			// Check loadBalancer ingress
+			ingress, found, _ := unstructured.NestedSlice(s.Object, "status", "loadBalancer", "ingress")
+			if found && len(ingress) > 0 {
+				var ips []string
+				for _, ing := range ingress {
+					if ingMap, ok := ing.(map[string]interface{}); ok {
+						if ip, ok := ingMap["ip"].(string); ok && ip != "" {
+							ips = append(ips, ip)
+						} else if hostname, ok := ingMap["hostname"].(string); ok && hostname != "" {
+							ips = append(ips, hostname)
+						}
+					}
+				}
+				if len(ips) > 0 {
+					data.externalIP = strings.Join(ips, ",")
+				}
+			}
+			if data.externalIP == "" {
+				data.externalIP = "<none>"
+			}
+		}
+
+		// Ports
+		ports, found, _ := unstructured.NestedSlice(s.Object, "spec", "ports")
+		if found {
+			var portStrs []string
+			for _, p := range ports {
+				if pMap, ok := p.(map[string]interface{}); ok {
+					port, _, _ := unstructured.NestedInt64(pMap, "port")
+					protocol, _, _ := unstructured.NestedString(pMap, "protocol")
+					if protocol == "" {
+						protocol = "TCP"
+					}
+					nodePort, nodePortFound, _ := unstructured.NestedInt64(pMap, "nodePort")
+					if nodePortFound && nodePort > 0 {
+						portStrs = append(portStrs, fmt.Sprintf("%d:%d/%s", port, nodePort, protocol))
+					} else {
+						portStrs = append(portStrs, fmt.Sprintf("%d/%s", port, protocol))
+					}
+				}
+			}
+			data.ports = strings.Join(portStrs, ",")
+		}
+		if data.ports == "" {
+			data.ports = "<none>"
+		}
+
+		// Age
+		if ts, found, _ := unstructured.NestedString(s.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else {
+				data.age = "<unknown>"
+			}
+		} else {
+			data.age = "<unknown>"
+		}
+
+		if wide {
+			selector, _, _ := unstructured.NestedStringMap(s.Object, "spec", "selector")
+			var selParts []string
+			for k, v := range selector {
+				selParts = append(selParts, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.selector = strings.Join(selParts, ",")
+			if data.selector == "" {
+				data.selector = "<none>"
+			}
+		}
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(s.Object, "metadata", "labels")
+			var labelParts []string
+			for k, v := range labels {
+				labelParts = append(labelParts, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelParts, ",")
+			if data.labels == "" {
+				data.labels = "<none>"
+			}
+		}
+
+		svcList = append(svcList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.svcType) > widths["type"] { widths["type"] = len(data.svcType) }
+		if len(data.clusterIP) > widths["clusterip"] { widths["clusterip"] = len(data.clusterIP) }
+		if len(data.externalIP) > widths["externalip"] { widths["externalip"] = len(data.externalIP) }
+		if len(data.ports) > widths["ports"] { widths["ports"] = len(data.ports) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if wide && len(data.selector) > widths["selector"] { widths["selector"] = len(data.selector) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	// Build format
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["type"]),
+		fmt.Sprintf("%%-%ds", widths["clusterip"]),
+		fmt.Sprintf("%%-%ds", widths["externalip"]),
+		fmt.Sprintf("%%-%ds", widths["ports"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "TYPE", "CLUSTER-IP", "EXTERNAL-IP", "PORT(S)", "AGE")
+	if wide {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["selector"]))
+		hdrParts = append(hdrParts, "SELECTOR")
+	}
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+
+	for _, data := range svcList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.svcType, data.clusterIP, data.externalIP, data.ports, data.age)
+		if wide { row = append(row, data.selector) }
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printDeploymentsTableFromUnstructured prints deployments directly from UnstructuredList
+func printDeploymentsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type deployData struct {
+		namespace  string
+		name       string
+		ready      string
+		upToDate   string
+		available  string
+		age        string
+		containers string
+		images     string
+		selector   string
+		labels     string
+	}
+
+	var deployList []deployData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"ready":     len("READY"),
+		"uptodate":  len("UP-TO-DATE"),
+		"available": len("AVAILABLE"),
+		"age":       len("AGE"),
+	}
+	if wide {
+		widths["containers"] = len("CONTAINERS")
+		widths["images"] = len("IMAGES")
+		widths["selector"] = len("SELECTOR")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for i := range list.Items {
+		d := &list.Items[i]
+		var data deployData
+
+		data.name, _, _ = unstructured.NestedString(d.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(d.Object, "metadata", "namespace")
+
+		replicas, _, _ := unstructured.NestedInt64(d.Object, "spec", "replicas")
+		readyReplicas, _, _ := unstructured.NestedInt64(d.Object, "status", "readyReplicas")
+		updatedReplicas, _, _ := unstructured.NestedInt64(d.Object, "status", "updatedReplicas")
+		availableReplicas, _, _ := unstructured.NestedInt64(d.Object, "status", "availableReplicas")
+
+		data.ready = fmt.Sprintf("%d/%d", readyReplicas, replicas)
+		data.upToDate = fmt.Sprintf("%d", updatedReplicas)
+		data.available = fmt.Sprintf("%d", availableReplicas)
+
+		if ts, found, _ := unstructured.NestedString(d.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else {
+				data.age = "<unknown>"
+			}
+		} else {
+			data.age = "<unknown>"
+		}
+
+		if wide {
+			containers, found, _ := unstructured.NestedSlice(d.Object, "spec", "template", "spec", "containers")
+			if found {
+				var names, imgs []string
+				for _, c := range containers {
+					if cMap, ok := c.(map[string]interface{}); ok {
+						if name, ok := cMap["name"].(string); ok {
+							names = append(names, name)
+						}
+						if img, ok := cMap["image"].(string); ok {
+							imgs = append(imgs, img)
+						}
+					}
+				}
+				data.containers = strings.Join(names, ",")
+				data.images = strings.Join(imgs, ",")
+			}
+			if data.containers == "" { data.containers = "<none>" }
+			if data.images == "" { data.images = "<none>" }
+
+			selector, _, _ := unstructured.NestedStringMap(d.Object, "spec", "selector", "matchLabels")
+			var selParts []string
+			for k, v := range selector {
+				selParts = append(selParts, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.selector = strings.Join(selParts, ",")
+			if data.selector == "" { data.selector = "<none>" }
+		}
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(d.Object, "metadata", "labels")
+			var labelParts []string
+			for k, v := range labels {
+				labelParts = append(labelParts, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelParts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		deployList = append(deployList, data)
+
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.ready) > widths["ready"] { widths["ready"] = len(data.ready) }
+		if len(data.upToDate) > widths["uptodate"] { widths["uptodate"] = len(data.upToDate) }
+		if len(data.available) > widths["available"] { widths["available"] = len(data.available) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if wide {
+			if len(data.containers) > widths["containers"] { widths["containers"] = len(data.containers) }
+			if len(data.images) > widths["images"] { widths["images"] = len(data.images) }
+			if len(data.selector) > widths["selector"] { widths["selector"] = len(data.selector) }
+		}
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["uptodate"]),
+		fmt.Sprintf("%%-%ds", widths["available"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "READY", "UP-TO-DATE", "AVAILABLE", "AGE")
+	if wide {
+		fmtParts = append(fmtParts,
+			fmt.Sprintf("%%-%ds", widths["containers"]),
+			fmt.Sprintf("%%-%ds", widths["images"]),
+			fmt.Sprintf("%%-%ds", widths["selector"]))
+		hdrParts = append(hdrParts, "CONTAINERS", "IMAGES", "SELECTOR")
+	}
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+
+	for _, data := range deployList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.ready, data.upToDate, data.available, data.age)
+		if wide { row = append(row, data.containers, data.images, data.selector) }
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printNodesTableFromUnstructured prints nodes directly from UnstructuredList
+func printNodesTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, showLabels bool, wide bool) error {
+	type nodeData struct {
+		name       string
+		status     string
+		roles      string
+		age        string
+		version    string
+		internalIP string
+		externalIP string
+		osImage    string
+		kernel     string
+		container  string
+		labels     string
+	}
+
+	var nodeList []nodeData
+	widths := map[string]int{
+		"name":    len("NAME"),
+		"status":  len("STATUS"),
+		"roles":   len("ROLES"),
+		"age":     len("AGE"),
+		"version": len("VERSION"),
+	}
+	if wide {
+		widths["internalip"] = len("INTERNAL-IP")
+		widths["externalip"] = len("EXTERNAL-IP")
+		widths["osimage"] = len("OS-IMAGE")
+		widths["kernel"] = len("KERNEL-VERSION")
+		widths["container"] = len("CONTAINER-RUNTIME")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for i := range list.Items {
+		n := &list.Items[i]
+		var data nodeData
+
+		data.name, _, _ = unstructured.NestedString(n.Object, "metadata", "name")
+
+		// Status from conditions
+		conditions, found, _ := unstructured.NestedSlice(n.Object, "status", "conditions")
+		data.status = "Unknown"
+		if found {
+			for _, c := range conditions {
+				if cMap, ok := c.(map[string]interface{}); ok {
+					if cType, _ := cMap["type"].(string); cType == "Ready" {
+						if status, _ := cMap["status"].(string); status == "True" {
+							data.status = "Ready"
+						} else {
+							data.status = "NotReady"
+						}
+						break
+					}
+				}
+			}
+		}
+
+		// Check if unschedulable
+		if unschedulable, found, _ := unstructured.NestedBool(n.Object, "spec", "unschedulable"); found && unschedulable {
+			data.status += ",SchedulingDisabled"
+		}
+
+		// Roles from labels
+		labels, _, _ := unstructured.NestedStringMap(n.Object, "metadata", "labels")
+		var roles []string
+		for k := range labels {
+			if strings.HasPrefix(k, "node-role.kubernetes.io/") {
+				role := strings.TrimPrefix(k, "node-role.kubernetes.io/")
+				if role != "" {
+					roles = append(roles, role)
+				}
+			}
+		}
+		if len(roles) > 0 {
+			data.roles = strings.Join(roles, ",")
+		} else {
+			data.roles = "<none>"
+		}
+
+		// Age
+		if ts, found, _ := unstructured.NestedString(n.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else {
+				data.age = "<unknown>"
+			}
+		} else {
+			data.age = "<unknown>"
+		}
+
+		// Version
+		data.version, _, _ = unstructured.NestedString(n.Object, "status", "nodeInfo", "kubeletVersion")
+		if data.version == "" {
+			data.version = "<unknown>"
+		}
+
+		if wide {
+			// Get addresses
+			addresses, found, _ := unstructured.NestedSlice(n.Object, "status", "addresses")
+			if found {
+				for _, addr := range addresses {
+					if addrMap, ok := addr.(map[string]interface{}); ok {
+						addrType, _ := addrMap["type"].(string)
+						addrVal, _ := addrMap["address"].(string)
+						if addrType == "InternalIP" {
+							data.internalIP = addrVal
+						} else if addrType == "ExternalIP" {
+							data.externalIP = addrVal
+						}
+					}
+				}
+			}
+			if data.internalIP == "" { data.internalIP = "<none>" }
+			if data.externalIP == "" { data.externalIP = "<none>" }
+
+			data.osImage, _, _ = unstructured.NestedString(n.Object, "status", "nodeInfo", "osImage")
+			if data.osImage == "" { data.osImage = "<unknown>" }
+			data.kernel, _, _ = unstructured.NestedString(n.Object, "status", "nodeInfo", "kernelVersion")
+			if data.kernel == "" { data.kernel = "<unknown>" }
+			data.container, _, _ = unstructured.NestedString(n.Object, "status", "nodeInfo", "containerRuntimeVersion")
+			if data.container == "" { data.container = "<unknown>" }
+		}
+
+		if showLabels {
+			var labelParts []string
+			for k, v := range labels {
+				labelParts = append(labelParts, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelParts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		nodeList = append(nodeList, data)
+
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.status) > widths["status"] { widths["status"] = len(data.status) }
+		if len(data.roles) > widths["roles"] { widths["roles"] = len(data.roles) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if len(data.version) > widths["version"] { widths["version"] = len(data.version) }
+		if wide {
+			if len(data.internalIP) > widths["internalip"] { widths["internalip"] = len(data.internalIP) }
+			if len(data.externalIP) > widths["externalip"] { widths["externalip"] = len(data.externalIP) }
+			if len(data.osImage) > widths["osimage"] { widths["osimage"] = len(data.osImage) }
+			if len(data.kernel) > widths["kernel"] { widths["kernel"] = len(data.kernel) }
+			if len(data.container) > widths["container"] { widths["container"] = len(data.container) }
+		}
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	fmtParts = append(fmtParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["status"]),
+		fmt.Sprintf("%%-%ds", widths["roles"]),
+		fmt.Sprintf("%%-%ds", widths["age"]),
+		fmt.Sprintf("%%-%ds", widths["version"]))
+	hdrParts = append(hdrParts, "NAME", "STATUS", "ROLES", "AGE", "VERSION")
+	if wide {
+		fmtParts = append(fmtParts,
+			fmt.Sprintf("%%-%ds", widths["internalip"]),
+			fmt.Sprintf("%%-%ds", widths["externalip"]),
+			fmt.Sprintf("%%-%ds", widths["osimage"]),
+			fmt.Sprintf("%%-%ds", widths["kernel"]),
+			fmt.Sprintf("%%-%ds", widths["container"]))
+		hdrParts = append(hdrParts, "INTERNAL-IP", "EXTERNAL-IP", "OS-IMAGE", "KERNEL-VERSION", "CONTAINER-RUNTIME")
+	}
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+
+	for _, data := range nodeList {
+		var row []interface{}
+		row = append(row, data.name, data.status, data.roles, data.age, data.version)
+		if wide { row = append(row, data.internalIP, data.externalIP, data.osImage, data.kernel, data.container) }
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printNamespacesTableFromUnstructured prints namespaces directly from UnstructuredList
+func printNamespacesTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, showLabels bool, wide bool) error {
+	type nsData struct {
+		name   string
+		status string
+		age    string
+		labels string
+	}
+
+	var nsList []nsData
+	widths := map[string]int{
+		"name":   len("NAME"),
+		"status": len("STATUS"),
+		"age":    len("AGE"),
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	for i := range list.Items {
+		n := &list.Items[i]
+		var data nsData
+
+		data.name, _, _ = unstructured.NestedString(n.Object, "metadata", "name")
+		data.status, _, _ = unstructured.NestedString(n.Object, "status", "phase")
+		if data.status == "" {
+			data.status = "Active"
+		}
+
+		if ts, found, _ := unstructured.NestedString(n.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else {
+				data.age = "<unknown>"
+			}
+		} else {
+			data.age = "<unknown>"
+		}
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(n.Object, "metadata", "labels")
+			var labelParts []string
+			for k, v := range labels {
+				labelParts = append(labelParts, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelParts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		nsList = append(nsList, data)
+
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.status) > widths["status"] { widths["status"] = len(data.status) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	fmtParts = append(fmtParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["status"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "STATUS", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+
+	for _, data := range nsList {
+		var row []interface{}
+		row = append(row, data.name, data.status, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printSecretsTableFromUnstructured prints secrets directly from UnstructuredList
+func printSecretsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type secretData struct {
+		namespace string
+		name      string
+		sType     string
+		dataCount string
+		age       string
+		labels    string
+	}
+
+	var secretList []secretData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"type":      len("TYPE"),
+		"data":      len("DATA"),
+		"age":       len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		s := &list.Items[i]
+		var data secretData
+
+		data.name, _, _ = unstructured.NestedString(s.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(s.Object, "metadata", "namespace")
+		data.sType, _, _ = unstructured.NestedString(s.Object, "type")
+		if data.sType == "" { data.sType = "Opaque" }
+
+		dataMap, _, _ := unstructured.NestedMap(s.Object, "data")
+		data.dataCount = fmt.Sprintf("%d", len(dataMap))
+
+		if ts, found, _ := unstructured.NestedString(s.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(s.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		secretList = append(secretList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.sType) > widths["type"] { widths["type"] = len(data.sType) }
+		if len(data.dataCount) > widths["data"] { widths["data"] = len(data.dataCount) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["type"]),
+		fmt.Sprintf("%%-%ds", widths["data"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "TYPE", "DATA", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range secretList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.sType, data.dataCount, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printConfigMapsTableFromUnstructured prints configmaps directly from UnstructuredList
+func printConfigMapsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type cmData struct {
+		namespace string
+		name      string
+		dataCount string
+		age       string
+		labels    string
+	}
+
+	var cmList []cmData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"data":      len("DATA"),
+		"age":       len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		c := &list.Items[i]
+		var data cmData
+
+		data.name, _, _ = unstructured.NestedString(c.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(c.Object, "metadata", "namespace")
+
+		dataMap, _, _ := unstructured.NestedMap(c.Object, "data")
+		binaryData, _, _ := unstructured.NestedMap(c.Object, "binaryData")
+		data.dataCount = fmt.Sprintf("%d", len(dataMap)+len(binaryData))
+
+		if ts, found, _ := unstructured.NestedString(c.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(c.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		cmList = append(cmList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.dataCount) > widths["data"] { widths["data"] = len(data.dataCount) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["data"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "DATA", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range cmList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.dataCount, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printServiceAccountsTableFromUnstructured prints service accounts directly from UnstructuredList
+func printServiceAccountsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type saData struct {
+		namespace   string
+		name        string
+		secretCount string
+		age         string
+		labels      string
+	}
+
+	var saList []saData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"secrets":   len("SECRETS"),
+		"age":       len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		s := &list.Items[i]
+		var data saData
+
+		data.name, _, _ = unstructured.NestedString(s.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(s.Object, "metadata", "namespace")
+
+		secrets, _, _ := unstructured.NestedSlice(s.Object, "secrets")
+		data.secretCount = fmt.Sprintf("%d", len(secrets))
+
+		if ts, found, _ := unstructured.NestedString(s.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(s.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		saList = append(saList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.secretCount) > widths["secrets"] { widths["secrets"] = len(data.secretCount) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["secrets"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "SECRETS", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range saList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.secretCount, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printReplicaSetsTableFromUnstructured prints replicasets directly from UnstructuredList
+func printReplicaSetsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type rsData struct {
+		namespace string
+		name      string
+		desired   string
+		current   string
+		ready     string
+		age       string
+		labels    string
+	}
+
+	var rsList []rsData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"desired":   len("DESIRED"),
+		"current":   len("CURRENT"),
+		"ready":     len("READY"),
+		"age":       len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		r := &list.Items[i]
+		var data rsData
+
+		data.name, _, _ = unstructured.NestedString(r.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(r.Object, "metadata", "namespace")
+
+		desired, _, _ := unstructured.NestedInt64(r.Object, "spec", "replicas")
+		current, _, _ := unstructured.NestedInt64(r.Object, "status", "replicas")
+		ready, _, _ := unstructured.NestedInt64(r.Object, "status", "readyReplicas")
+
+		data.desired = fmt.Sprintf("%d", desired)
+		data.current = fmt.Sprintf("%d", current)
+		data.ready = fmt.Sprintf("%d", ready)
+
+		if ts, found, _ := unstructured.NestedString(r.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(r.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		rsList = append(rsList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.desired) > widths["desired"] { widths["desired"] = len(data.desired) }
+		if len(data.current) > widths["current"] { widths["current"] = len(data.current) }
+		if len(data.ready) > widths["ready"] { widths["ready"] = len(data.ready) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["desired"]),
+		fmt.Sprintf("%%-%ds", widths["current"]), fmt.Sprintf("%%-%ds", widths["ready"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "DESIRED", "CURRENT", "READY", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range rsList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.desired, data.current, data.ready, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printStatefulSetsTableFromUnstructured prints statefulsets directly from UnstructuredList
+func printStatefulSetsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type stsData struct {
+		namespace string
+		name      string
+		ready     string
+		age       string
+		labels    string
+	}
+
+	var stsList []stsData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"ready":     len("READY"),
+		"age":       len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		s := &list.Items[i]
+		var data stsData
+
+		data.name, _, _ = unstructured.NestedString(s.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(s.Object, "metadata", "namespace")
+
+		replicas, _, _ := unstructured.NestedInt64(s.Object, "spec", "replicas")
+		ready, _, _ := unstructured.NestedInt64(s.Object, "status", "readyReplicas")
+		data.ready = fmt.Sprintf("%d/%d", ready, replicas)
+
+		if ts, found, _ := unstructured.NestedString(s.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(s.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		stsList = append(stsList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.ready) > widths["ready"] { widths["ready"] = len(data.ready) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["ready"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "READY", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range stsList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.ready, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printDaemonSetsTableFromUnstructured prints daemonsets directly from UnstructuredList
+func printDaemonSetsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type dsData struct {
+		namespace        string
+		name             string
+		desired          string
+		current          string
+		ready            string
+		upToDate         string
+		available        string
+		nodeSelector     string
+		age              string
+		labels           string
+	}
+
+	var dsList []dsData
+	widths := map[string]int{
+		"namespace":    len("NAMESPACE"),
+		"name":         len("NAME"),
+		"desired":      len("DESIRED"),
+		"current":      len("CURRENT"),
+		"ready":        len("READY"),
+		"uptodate":     len("UP-TO-DATE"),
+		"available":    len("AVAILABLE"),
+		"nodeselector": len("NODE SELECTOR"),
+		"age":          len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		d := &list.Items[i]
+		var data dsData
+
+		data.name, _, _ = unstructured.NestedString(d.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(d.Object, "metadata", "namespace")
+
+		desired, _, _ := unstructured.NestedInt64(d.Object, "status", "desiredNumberScheduled")
+		current, _, _ := unstructured.NestedInt64(d.Object, "status", "currentNumberScheduled")
+		ready, _, _ := unstructured.NestedInt64(d.Object, "status", "numberReady")
+		upToDate, _, _ := unstructured.NestedInt64(d.Object, "status", "updatedNumberScheduled")
+		available, _, _ := unstructured.NestedInt64(d.Object, "status", "numberAvailable")
+
+		data.desired = fmt.Sprintf("%d", desired)
+		data.current = fmt.Sprintf("%d", current)
+		data.ready = fmt.Sprintf("%d", ready)
+		data.upToDate = fmt.Sprintf("%d", upToDate)
+		data.available = fmt.Sprintf("%d", available)
+
+		nodeSelector, _, _ := unstructured.NestedStringMap(d.Object, "spec", "template", "spec", "nodeSelector")
+		var nsParts []string
+		for k, v := range nodeSelector { nsParts = append(nsParts, fmt.Sprintf("%s=%s", k, v)) }
+		data.nodeSelector = strings.Join(nsParts, ",")
+		if data.nodeSelector == "" { data.nodeSelector = "<none>" }
+
+		if ts, found, _ := unstructured.NestedString(d.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(d.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		dsList = append(dsList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.desired) > widths["desired"] { widths["desired"] = len(data.desired) }
+		if len(data.current) > widths["current"] { widths["current"] = len(data.current) }
+		if len(data.ready) > widths["ready"] { widths["ready"] = len(data.ready) }
+		if len(data.upToDate) > widths["uptodate"] { widths["uptodate"] = len(data.upToDate) }
+		if len(data.available) > widths["available"] { widths["available"] = len(data.available) }
+		if len(data.nodeSelector) > widths["nodeselector"] { widths["nodeselector"] = len(data.nodeSelector) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["desired"]),
+		fmt.Sprintf("%%-%ds", widths["current"]), fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["uptodate"]), fmt.Sprintf("%%-%ds", widths["available"]),
+		fmt.Sprintf("%%-%ds", widths["nodeselector"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "DESIRED", "CURRENT", "READY", "UP-TO-DATE", "AVAILABLE", "NODE SELECTOR", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range dsList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.desired, data.current, data.ready, data.upToDate, data.available, data.nodeSelector, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printJobsTableFromUnstructured prints jobs directly from UnstructuredList
+func printJobsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type jobData struct {
+		namespace   string
+		name        string
+		completions string
+		duration    string
+		age         string
+		labels      string
+	}
+
+	var jobList []jobData
+	widths := map[string]int{
+		"namespace":   len("NAMESPACE"),
+		"name":        len("NAME"),
+		"completions": len("COMPLETIONS"),
+		"duration":    len("DURATION"),
+		"age":         len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		j := &list.Items[i]
+		var data jobData
+
+		data.name, _, _ = unstructured.NestedString(j.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(j.Object, "metadata", "namespace")
+
+		completions, _, _ := unstructured.NestedInt64(j.Object, "spec", "completions")
+		succeeded, _, _ := unstructured.NestedInt64(j.Object, "status", "succeeded")
+		data.completions = fmt.Sprintf("%d/%d", succeeded, completions)
+
+		// Duration
+		startTime, startFound, _ := unstructured.NestedString(j.Object, "status", "startTime")
+		completionTime, compFound, _ := unstructured.NestedString(j.Object, "status", "completionTime")
+		if startFound && compFound && startTime != "" && completionTime != "" {
+			if st, err1 := time.Parse(time.RFC3339, startTime); err1 == nil {
+				if ct, err2 := time.Parse(time.RFC3339, completionTime); err2 == nil {
+					data.duration = formatDuration(ct.Sub(st))
+				}
+			}
+		}
+		if data.duration == "" { data.duration = "<none>" }
+
+		if ts, found, _ := unstructured.NestedString(j.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(j.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		jobList = append(jobList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.completions) > widths["completions"] { widths["completions"] = len(data.completions) }
+		if len(data.duration) > widths["duration"] { widths["duration"] = len(data.duration) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["completions"]),
+		fmt.Sprintf("%%-%ds", widths["duration"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "COMPLETIONS", "DURATION", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range jobList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.completions, data.duration, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printCronJobsTableFromUnstructured prints cronjobs directly from UnstructuredList
+func printCronJobsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type cjData struct {
+		namespace    string
+		name         string
+		schedule     string
+		suspend      string
+		active       string
+		lastSchedule string
+		age          string
+		labels       string
+	}
+
+	var cjList []cjData
+	widths := map[string]int{
+		"namespace":    len("NAMESPACE"),
+		"name":         len("NAME"),
+		"schedule":     len("SCHEDULE"),
+		"suspend":      len("SUSPEND"),
+		"active":       len("ACTIVE"),
+		"lastschedule": len("LAST SCHEDULE"),
+		"age":          len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		c := &list.Items[i]
+		var data cjData
+
+		data.name, _, _ = unstructured.NestedString(c.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(c.Object, "metadata", "namespace")
+		data.schedule, _, _ = unstructured.NestedString(c.Object, "spec", "schedule")
+		if data.schedule == "" { data.schedule = "<none>" }
+
+		suspend, _, _ := unstructured.NestedBool(c.Object, "spec", "suspend")
+		data.suspend = fmt.Sprintf("%t", suspend)
+
+		active, _, _ := unstructured.NestedSlice(c.Object, "status", "active")
+		data.active = fmt.Sprintf("%d", len(active))
+
+		if lastSchedule, found, _ := unstructured.NestedString(c.Object, "status", "lastScheduleTime"); found && lastSchedule != "" {
+			if t, err := time.Parse(time.RFC3339, lastSchedule); err == nil {
+				data.lastSchedule = formatAge(t)
+			} else { data.lastSchedule = "<none>" }
+		} else { data.lastSchedule = "<none>" }
+
+		if ts, found, _ := unstructured.NestedString(c.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(c.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		cjList = append(cjList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.schedule) > widths["schedule"] { widths["schedule"] = len(data.schedule) }
+		if len(data.suspend) > widths["suspend"] { widths["suspend"] = len(data.suspend) }
+		if len(data.active) > widths["active"] { widths["active"] = len(data.active) }
+		if len(data.lastSchedule) > widths["lastschedule"] { widths["lastschedule"] = len(data.lastSchedule) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["schedule"]),
+		fmt.Sprintf("%%-%ds", widths["suspend"]), fmt.Sprintf("%%-%ds", widths["active"]),
+		fmt.Sprintf("%%-%ds", widths["lastschedule"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "SCHEDULE", "SUSPEND", "ACTIVE", "LAST SCHEDULE", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range cjList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.schedule, data.suspend, data.active, data.lastSchedule, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printMCPTableFromUnstructured prints machineconfigpools directly from UnstructuredList
+func printMCPTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, showLabels bool, wide bool) error {
+	type mcpData struct {
+		name     string
+		config   string
+		updated  string
+		updating string
+		degraded string
+		labels   string
+	}
+
+	var mcpList []mcpData
+	widths := map[string]int{
+		"name":     len("NAME"),
+		"config":   len("CONFIG"),
+		"updated":  len("UPDATED"),
+		"updating": len("UPDATING"),
+		"degraded": len("DEGRADED"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		m := &list.Items[i]
+		var data mcpData
+
+		data.name, _, _ = unstructured.NestedString(m.Object, "metadata", "name")
+		data.config, _, _ = unstructured.NestedString(m.Object, "status", "configuration", "name")
+		if data.config == "" { data.config = "<none>" }
+
+		conditions, found, _ := unstructured.NestedSlice(m.Object, "status", "conditions")
+		data.updated = "Unknown"
+		data.updating = "Unknown"
+		data.degraded = "Unknown"
+		if found {
+			for _, c := range conditions {
+				if cMap, ok := c.(map[string]interface{}); ok {
+					cType, _ := cMap["type"].(string)
+					cStatus, _ := cMap["status"].(string)
+					switch cType {
+					case "Updated":
+						data.updated = cStatus
+					case "Updating":
+						data.updating = cStatus
+					case "Degraded":
+						data.degraded = cStatus
+					}
+				}
+			}
+		}
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(m.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		mcpList = append(mcpList, data)
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.config) > widths["config"] { widths["config"] = len(data.config) }
+		if len(data.updated) > widths["updated"] { widths["updated"] = len(data.updated) }
+		if len(data.updating) > widths["updating"] { widths["updating"] = len(data.updating) }
+		if len(data.degraded) > widths["degraded"] { widths["degraded"] = len(data.degraded) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["config"]),
+		fmt.Sprintf("%%-%ds", widths["updated"]), fmt.Sprintf("%%-%ds", widths["updating"]), fmt.Sprintf("%%-%ds", widths["degraded"]))
+	hdrParts = append(hdrParts, "NAME", "CONFIG", "UPDATED", "UPDATING", "DEGRADED")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range mcpList {
+		var row []interface{}
+		row = append(row, data.name, data.config, data.updated, data.updating, data.degraded)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printRoutesTableFromUnstructured prints routes directly from UnstructuredList
+func printRoutesTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, showLabels bool, allNamespaces bool, wide bool) error {
+	type routeData struct {
+		namespace   string
+		name        string
+		host        string
+		path        string
+		services    string
+		port        string
+		termination string
+		wildcard    string
+		labels      string
+	}
+
+	var routeList []routeData
+	widths := map[string]int{
+		"namespace":   len("NAMESPACE"),
+		"name":        len("NAME"),
+		"host":        len("HOST/PORT"),
+		"path":        len("PATH"),
+		"services":    len("SERVICES"),
+		"port":        len("PORT"),
+		"termination": len("TERMINATION"),
+		"wildcard":    len("WILDCARD"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		r := &list.Items[i]
+		var data routeData
+
+		data.name, _, _ = unstructured.NestedString(r.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(r.Object, "metadata", "namespace")
+		data.host, _, _ = unstructured.NestedString(r.Object, "spec", "host")
+		if data.host == "" { data.host = "<none>" }
+		data.path, _, _ = unstructured.NestedString(r.Object, "spec", "path")
+		if data.path == "" { data.path = "/" }
+
+		toService, _, _ := unstructured.NestedString(r.Object, "spec", "to", "name")
+		data.services = toService
+		if data.services == "" { data.services = "<none>" }
+
+		targetPort, _, _ := unstructured.NestedString(r.Object, "spec", "port", "targetPort")
+		data.port = targetPort
+		if data.port == "" { data.port = "<all>" }
+
+		termination, _, _ := unstructured.NestedString(r.Object, "spec", "tls", "termination")
+		data.termination = termination
+		if data.termination == "" { data.termination = "None" }
+
+		wildcardPolicy, _, _ := unstructured.NestedString(r.Object, "spec", "wildcardPolicy")
+		data.wildcard = wildcardPolicy
+		if data.wildcard == "" { data.wildcard = "None" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(r.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		routeList = append(routeList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.host) > widths["host"] { widths["host"] = len(data.host) }
+		if len(data.path) > widths["path"] { widths["path"] = len(data.path) }
+		if len(data.services) > widths["services"] { widths["services"] = len(data.services) }
+		if len(data.port) > widths["port"] { widths["port"] = len(data.port) }
+		if len(data.termination) > widths["termination"] { widths["termination"] = len(data.termination) }
+		if len(data.wildcard) > widths["wildcard"] { widths["wildcard"] = len(data.wildcard) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["host"]),
+		fmt.Sprintf("%%-%ds", widths["path"]), fmt.Sprintf("%%-%ds", widths["services"]),
+		fmt.Sprintf("%%-%ds", widths["port"]), fmt.Sprintf("%%-%ds", widths["termination"]),
+		fmt.Sprintf("%%-%ds", widths["wildcard"]))
+	hdrParts = append(hdrParts, "NAME", "HOST/PORT", "PATH", "SERVICES", "PORT", "TERMINATION", "WILDCARD")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range routeList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.host, data.path, data.services, data.port, data.termination, data.wildcard)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printPVCTableFromUnstructured prints PVCs directly from UnstructuredList
+func printPVCTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type pvcData struct {
+		namespace    string
+		name         string
+		status       string
+		volume       string
+		capacity     string
+		accessModes  string
+		storageClass string
+		age          string
+		labels       string
+	}
+
+	var pvcList []pvcData
+	widths := map[string]int{
+		"namespace":    len("NAMESPACE"),
+		"name":         len("NAME"),
+		"status":       len("STATUS"),
+		"volume":       len("VOLUME"),
+		"capacity":     len("CAPACITY"),
+		"accessmodes":  len("ACCESS MODES"),
+		"storageclass": len("STORAGECLASS"),
+		"age":          len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		p := &list.Items[i]
+		var data pvcData
+
+		data.name, _, _ = unstructured.NestedString(p.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(p.Object, "metadata", "namespace")
+		data.status, _, _ = unstructured.NestedString(p.Object, "status", "phase")
+		if data.status == "" { data.status = "Pending" }
+		data.volume, _, _ = unstructured.NestedString(p.Object, "spec", "volumeName")
+		if data.volume == "" { data.volume = "<none>" }
+		data.capacity, _, _ = unstructured.NestedString(p.Object, "status", "capacity", "storage")
+		if data.capacity == "" { data.capacity = "<none>" }
+
+		accessModes, _, _ := unstructured.NestedStringSlice(p.Object, "status", "accessModes")
+		data.accessModes = strings.Join(accessModes, ",")
+		if data.accessModes == "" { data.accessModes = "<none>" }
+
+		data.storageClass, _, _ = unstructured.NestedString(p.Object, "spec", "storageClassName")
+		if data.storageClass == "" { data.storageClass = "<none>" }
+
+		if ts, found, _ := unstructured.NestedString(p.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(p.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		pvcList = append(pvcList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.status) > widths["status"] { widths["status"] = len(data.status) }
+		if len(data.volume) > widths["volume"] { widths["volume"] = len(data.volume) }
+		if len(data.capacity) > widths["capacity"] { widths["capacity"] = len(data.capacity) }
+		if len(data.accessModes) > widths["accessmodes"] { widths["accessmodes"] = len(data.accessModes) }
+		if len(data.storageClass) > widths["storageclass"] { widths["storageclass"] = len(data.storageClass) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["status"]),
+		fmt.Sprintf("%%-%ds", widths["volume"]), fmt.Sprintf("%%-%ds", widths["capacity"]),
+		fmt.Sprintf("%%-%ds", widths["accessmodes"]), fmt.Sprintf("%%-%ds", widths["storageclass"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "STATUS", "VOLUME", "CAPACITY", "ACCESS MODES", "STORAGECLASS", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range pvcList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.status, data.volume, data.capacity, data.accessModes, data.storageClass, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printPVTableFromUnstructured prints PVs directly from UnstructuredList
+func printPVTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, showLabels bool, wide bool) error {
+	type pvData struct {
+		name          string
+		capacity      string
+		accessModes   string
+		reclaimPolicy string
+		status        string
+		claim         string
+		storageClass  string
+		reason        string
+		age           string
+		labels        string
+	}
+
+	var pvList []pvData
+	widths := map[string]int{
+		"name":          len("NAME"),
+		"capacity":      len("CAPACITY"),
+		"accessmodes":   len("ACCESS MODES"),
+		"reclaimpolicy": len("RECLAIM POLICY"),
+		"status":        len("STATUS"),
+		"claim":         len("CLAIM"),
+		"storageclass":  len("STORAGECLASS"),
+		"reason":        len("REASON"),
+		"age":           len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		p := &list.Items[i]
+		var data pvData
+
+		data.name, _, _ = unstructured.NestedString(p.Object, "metadata", "name")
+		data.capacity, _, _ = unstructured.NestedString(p.Object, "spec", "capacity", "storage")
+		if data.capacity == "" { data.capacity = "<none>" }
+
+		accessModes, _, _ := unstructured.NestedStringSlice(p.Object, "spec", "accessModes")
+		data.accessModes = strings.Join(accessModes, ",")
+		if data.accessModes == "" { data.accessModes = "<none>" }
+
+		data.reclaimPolicy, _, _ = unstructured.NestedString(p.Object, "spec", "persistentVolumeReclaimPolicy")
+		if data.reclaimPolicy == "" { data.reclaimPolicy = "Delete" }
+
+		data.status, _, _ = unstructured.NestedString(p.Object, "status", "phase")
+		if data.status == "" { data.status = "Available" }
+
+		claimNs, _, _ := unstructured.NestedString(p.Object, "spec", "claimRef", "namespace")
+		claimName, _, _ := unstructured.NestedString(p.Object, "spec", "claimRef", "name")
+		if claimNs != "" && claimName != "" {
+			data.claim = claimNs + "/" + claimName
+		} else { data.claim = "<none>" }
+
+		data.storageClass, _, _ = unstructured.NestedString(p.Object, "spec", "storageClassName")
+		if data.storageClass == "" { data.storageClass = "<none>" }
+
+		data.reason, _, _ = unstructured.NestedString(p.Object, "status", "reason")
+		if data.reason == "" { data.reason = "<none>" }
+
+		if ts, found, _ := unstructured.NestedString(p.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(p.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		pvList = append(pvList, data)
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.capacity) > widths["capacity"] { widths["capacity"] = len(data.capacity) }
+		if len(data.accessModes) > widths["accessmodes"] { widths["accessmodes"] = len(data.accessModes) }
+		if len(data.reclaimPolicy) > widths["reclaimpolicy"] { widths["reclaimpolicy"] = len(data.reclaimPolicy) }
+		if len(data.status) > widths["status"] { widths["status"] = len(data.status) }
+		if len(data.claim) > widths["claim"] { widths["claim"] = len(data.claim) }
+		if len(data.storageClass) > widths["storageclass"] { widths["storageclass"] = len(data.storageClass) }
+		if len(data.reason) > widths["reason"] { widths["reason"] = len(data.reason) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["capacity"]),
+		fmt.Sprintf("%%-%ds", widths["accessmodes"]), fmt.Sprintf("%%-%ds", widths["reclaimpolicy"]),
+		fmt.Sprintf("%%-%ds", widths["status"]), fmt.Sprintf("%%-%ds", widths["claim"]),
+		fmt.Sprintf("%%-%ds", widths["storageclass"]), fmt.Sprintf("%%-%ds", widths["reason"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "CAPACITY", "ACCESS MODES", "RECLAIM POLICY", "STATUS", "CLAIM", "STORAGECLASS", "REASON", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range pvList {
+		var row []interface{}
+		row = append(row, data.name, data.capacity, data.accessModes, data.reclaimPolicy, data.status, data.claim, data.storageClass, data.reason, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printIngressTableFromUnstructured prints ingresses directly from UnstructuredList
+func printIngressTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type ingData struct {
+		namespace string
+		name      string
+		class     string
+		hosts     string
+		address   string
+		ports     string
+		age       string
+		labels    string
+	}
+
+	var ingList []ingData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"class":     len("CLASS"),
+		"hosts":     len("HOSTS"),
+		"address":   len("ADDRESS"),
+		"ports":     len("PORTS"),
+		"age":       len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		ing := &list.Items[i]
+		var data ingData
+
+		data.name, _, _ = unstructured.NestedString(ing.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(ing.Object, "metadata", "namespace")
+		data.class, _, _ = unstructured.NestedString(ing.Object, "spec", "ingressClassName")
+		if data.class == "" { data.class = "<none>" }
+
+		rules, _, _ := unstructured.NestedSlice(ing.Object, "spec", "rules")
+		var hosts []string
+		for _, r := range rules {
+			if rMap, ok := r.(map[string]interface{}); ok {
+				if host, ok := rMap["host"].(string); ok && host != "" {
+					hosts = append(hosts, host)
+				}
+			}
+		}
+		data.hosts = strings.Join(hosts, ",")
+		if data.hosts == "" { data.hosts = "*" }
+
+		lbIngress, _, _ := unstructured.NestedSlice(ing.Object, "status", "loadBalancer", "ingress")
+		var addrs []string
+		for _, lb := range lbIngress {
+			if lbMap, ok := lb.(map[string]interface{}); ok {
+				if ip, ok := lbMap["ip"].(string); ok && ip != "" {
+					addrs = append(addrs, ip)
+				} else if hostname, ok := lbMap["hostname"].(string); ok && hostname != "" {
+					addrs = append(addrs, hostname)
+				}
+			}
+		}
+		data.address = strings.Join(addrs, ",")
+		if data.address == "" { data.address = "<none>" }
+
+		tls, _, _ := unstructured.NestedSlice(ing.Object, "spec", "tls")
+		if len(tls) > 0 {
+			data.ports = "80, 443"
+		} else {
+			data.ports = "80"
+		}
+
+		if ts, found, _ := unstructured.NestedString(ing.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(ing.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		ingList = append(ingList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.class) > widths["class"] { widths["class"] = len(data.class) }
+		if len(data.hosts) > widths["hosts"] { widths["hosts"] = len(data.hosts) }
+		if len(data.address) > widths["address"] { widths["address"] = len(data.address) }
+		if len(data.ports) > widths["ports"] { widths["ports"] = len(data.ports) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["class"]),
+		fmt.Sprintf("%%-%ds", widths["hosts"]), fmt.Sprintf("%%-%ds", widths["address"]),
+		fmt.Sprintf("%%-%ds", widths["ports"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "CLASS", "HOSTS", "ADDRESS", "PORTS", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range ingList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.class, data.hosts, data.address, data.ports, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printEventsTableFromUnstructured prints events directly from UnstructuredList
+func printEventsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type eventData struct {
+		namespace string
+		lastSeen  string
+		eventType string
+		reason    string
+		object    string
+		message   string
+	}
+
+	var eventList []eventData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"lastseen":  len("LAST SEEN"),
+		"type":      len("TYPE"),
+		"reason":    len("REASON"),
+		"object":    len("OBJECT"),
+		"message":   len("MESSAGE"),
+	}
+
+	for i := range list.Items {
+		e := &list.Items[i]
+		var data eventData
+
+		data.namespace, _, _ = unstructured.NestedString(e.Object, "metadata", "namespace")
+		data.eventType, _, _ = unstructured.NestedString(e.Object, "type")
+		if data.eventType == "" { data.eventType = "Normal" }
+		data.reason, _, _ = unstructured.NestedString(e.Object, "reason")
+		if data.reason == "" { data.reason = "<none>" }
+
+		kind, _, _ := unstructured.NestedString(e.Object, "involvedObject", "kind")
+		name, _, _ := unstructured.NestedString(e.Object, "involvedObject", "name")
+		data.object = kind + "/" + name
+		if data.object == "/" { data.object = "<none>" }
+
+		data.message, _, _ = unstructured.NestedString(e.Object, "message")
+		if len(data.message) > 80 { data.message = data.message[:77] + "..." }
+		if data.message == "" { data.message = "<none>" }
+
+		lastTime, _, _ := unstructured.NestedString(e.Object, "lastTimestamp")
+		if lastTime == "" {
+			lastTime, _, _ = unstructured.NestedString(e.Object, "eventTime")
+		}
+		if lastTime != "" {
+			if t, err := time.Parse(time.RFC3339, lastTime); err == nil {
+				data.lastSeen = formatAge(t)
+			} else { data.lastSeen = "<unknown>" }
+		} else { data.lastSeen = "<unknown>" }
+
+		eventList = append(eventList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.lastSeen) > widths["lastseen"] { widths["lastseen"] = len(data.lastSeen) }
+		if len(data.eventType) > widths["type"] { widths["type"] = len(data.eventType) }
+		if len(data.reason) > widths["reason"] { widths["reason"] = len(data.reason) }
+		if len(data.object) > widths["object"] { widths["object"] = len(data.object) }
+		if len(data.message) > widths["message"] { widths["message"] = len(data.message) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["lastseen"]), fmt.Sprintf("%%-%ds", widths["type"]),
+		fmt.Sprintf("%%-%ds", widths["reason"]), fmt.Sprintf("%%-%ds", widths["object"]),
+		fmt.Sprintf("%%-%ds", widths["message"]))
+	hdrParts = append(hdrParts, "LAST SEEN", "TYPE", "REASON", "OBJECT", "MESSAGE")
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range eventList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.lastSeen, data.eventType, data.reason, data.object, data.message)
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// printGenericTableFromUnstructured prints any resource type with basic info
+func printGenericTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
+	type genericData struct {
+		namespace string
+		name      string
+		age       string
+		labels    string
+	}
+
+	var dataList []genericData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"age":       len("AGE"),
+	}
+	if showLabels { widths["labels"] = len("LABELS") }
+
+	for i := range list.Items {
+		item := &list.Items[i]
+		var data genericData
+
+		data.name, _, _ = unstructured.NestedString(item.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(item.Object, "metadata", "namespace")
+
+		if ts, found, _ := unstructured.NestedString(item.Object, "metadata", "creationTimestamp"); found && ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				data.age = formatAge(t)
+			} else { data.age = "<unknown>" }
+		} else { data.age = "<unknown>" }
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(item.Object, "metadata", "labels")
+			var parts []string
+			for k, v := range labels { parts = append(parts, fmt.Sprintf("%s=%s", k, v)) }
+			data.labels = strings.Join(parts, ",")
+			if data.labels == "" { data.labels = "<none>" }
+		}
+
+		dataList = append(dataList, data)
+		if len(data.namespace) > widths["namespace"] { widths["namespace"] = len(data.namespace) }
+		if len(data.name) > widths["name"] { widths["name"] = len(data.name) }
+		if len(data.age) > widths["age"] { widths["age"] = len(data.age) }
+		if showLabels && len(data.labels) > widths["labels"] { widths["labels"] = len(data.labels) }
+	}
+
+	var fmtParts, hdrParts []string
+	if allNamespaces {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		hdrParts = append(hdrParts, "NAMESPACE")
+	}
+	fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["name"]), fmt.Sprintf("%%-%ds", widths["age"]))
+	hdrParts = append(hdrParts, "NAME", "AGE")
+	if showLabels {
+		fmtParts = append(fmtParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		hdrParts = append(hdrParts, "LABELS")
+	}
+
+	format := strings.Join(fmtParts, "   ") + "\n"
+	fmt.Fprintf(out, format, toInterfaceSlice(hdrParts)...)
+	for _, data := range dataList {
+		var row []interface{}
+		if allNamespaces { row = append(row, data.namespace) }
+		row = append(row, data.name, data.age)
+		if showLabels { row = append(row, data.labels) }
+		fmt.Fprintf(out, format, row...)
+	}
+	return nil
+}
+
+// formatDuration formats a duration for display
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	} else if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	} else if d < 24*time.Hour {
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+}
+
 func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
 	type podData struct {
 		namespace string
@@ -2269,15 +4223,15 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 			data.namespace = p.Namespace
 			data.name = p.Name
 
-			if wide {
+		if wide {
 				data.node = p.Spec.NodeName
-				if data.node == "" {
-					data.node = "<none>"
-				}
+			if data.node == "" {
+				data.node = "<none>"
+			}
 				data.ip = p.Status.PodIP
-				if data.ip == "" {
-					data.ip = "<none>"
-				}
+			if data.ip == "" {
+				data.ip = "<none>"
+			}
 				data.nominated = "<none>"
 			}
 
@@ -2337,7 +4291,7 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 			if creationTimestamp, found, _ := unstructured.NestedString(p.Object, "metadata", "creationTimestamp"); found && creationTimestamp != "" {
 				if t, err := time.Parse(time.RFC3339, creationTimestamp); err == nil {
 					data.age = formatAge(t)
-				} else {
+			} else {
 					data.age = "<unknown>"
 				}
 			} else {
@@ -2354,18 +4308,18 @@ func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, s
 					data.ip = "<none>"
 				}
 				data.nominated = "<none>"
-			}
+		}
 
-			if showLabels {
+		if showLabels {
 				labels, _, _ := unstructured.NestedStringMap(p.Object, "metadata", "labels")
 				labelPairs := make([]string, 0, len(labels))
 				for k, v := range labels {
-					labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
-				}
-				data.labels = strings.Join(labelPairs, ",")
-				if data.labels == "" {
-					data.labels = "<none>"
-				}
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelPairs, ",")
+			if data.labels == "" {
+				data.labels = "<none>"
+			}
 			}
 
 		default:

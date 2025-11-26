@@ -1834,15 +1834,6 @@ func convertUnstructuredToTyped(items []runtime.Object, resourceType string) []r
 }
 
 func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
-	items, err := meta.ExtractList(list)
-	if err != nil {
-		return err
-	}
-	if len(items) == 0 {
-		fmt.Fprintf(out, "No resources found.\n")
-		return nil
-	}
-
 	// Normalize resource type for comparison (handle singular/plural)
 	normalizedType := strings.ToLower(resourceType)
 	if strings.HasSuffix(normalizedType, "s") && len(normalizedType) > 1 {
@@ -1851,6 +1842,23 @@ func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces 
 		if normalizedType == "pods" || normalizedType == "services" || normalizedType == "deployments" || normalizedType == "nodes" || normalizedType == "namespaces" {
 			normalizedType = singular
 		}
+	}
+
+	// For pods, directly use the UnstructuredList to avoid any conversion issues
+	// This is the most reliable way to ensure status data is preserved
+	if normalizedType == "pods" || normalizedType == "po" || normalizedType == "pod" {
+		if uList, ok := list.(*unstructured.UnstructuredList); ok {
+			return printPodsTableFromUnstructured(uList, out, allNamespaces, showLabels, false)
+		}
+	}
+
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
 	}
 
 	// Convert unstructured to typed for known resource types
@@ -1895,15 +1903,6 @@ func printDefaultResourceList(list runtime.Object, out io.Writer, allNamespaces 
 }
 
 func printWideResourceList(list runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, resourceType string) error {
-	items, err := meta.ExtractList(list)
-	if err != nil {
-		return err
-	}
-	if len(items) == 0 {
-		fmt.Fprintf(out, "No resources found.\n")
-		return nil
-	}
-
 	// Normalize resource type for comparison (handle singular/plural)
 	normalizedType := strings.ToLower(resourceType)
 	if strings.HasSuffix(normalizedType, "s") && len(normalizedType) > 1 {
@@ -1912,6 +1911,23 @@ func printWideResourceList(list runtime.Object, out io.Writer, allNamespaces boo
 		if normalizedType == "pods" || normalizedType == "services" || normalizedType == "deployments" || normalizedType == "nodes" || normalizedType == "namespaces" {
 			normalizedType = singular
 		}
+	}
+
+	// For pods, directly use the UnstructuredList to avoid any conversion issues
+	// This is the most reliable way to ensure status data is preserved
+	if normalizedType == "pods" || normalizedType == "po" || normalizedType == "pod" {
+		if uList, ok := list.(*unstructured.UnstructuredList); ok {
+			return printPodsTableFromUnstructured(uList, out, allNamespaces, showLabels, true)
+		}
+	}
+
+	items, err := meta.ExtractList(list)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
 	}
 
 	// Convert unstructured to typed for known resource types
@@ -1968,6 +1984,219 @@ func getReadyContainers(pod *corev1.Pod) int {
 }
 
 // Table printing functions with dynamic column widths (like ocp node info)
+
+// printPodsTableFromUnstructured prints pods directly from an UnstructuredList
+// This is the most reliable method as it avoids any type conversion issues
+func printPodsTableFromUnstructured(list *unstructured.UnstructuredList, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
+	type podData struct {
+		namespace string
+		name      string
+		ready     string
+		status    string
+		restarts  string
+		age       string
+		node      string
+		ip        string
+		nominated string
+		labels    string
+	}
+
+	if len(list.Items) == 0 {
+		fmt.Fprintf(out, "No resources found.\n")
+		return nil
+	}
+
+	var podList []podData
+	widths := map[string]int{
+		"namespace": len("NAMESPACE"),
+		"name":      len("NAME"),
+		"ready":     len("READY"),
+		"status":    len("STATUS"),
+		"restarts":  len("RESTARTS"),
+		"age":       len("AGE"),
+	}
+
+	if wide {
+		widths["node"] = len("NODE")
+		widths["ip"] = len("IP")
+		widths["nominated"] = len("NOMINATED NODE")
+	}
+	if showLabels {
+		widths["labels"] = len("LABELS")
+	}
+
+	// Process each pod directly from the unstructured list
+	for i := range list.Items {
+		p := &list.Items[i]
+		var data podData
+
+		// Get basic metadata
+		data.name, _, _ = unstructured.NestedString(p.Object, "metadata", "name")
+		data.namespace, _, _ = unstructured.NestedString(p.Object, "metadata", "namespace")
+
+		// Get status phase
+		data.status, _, _ = unstructured.NestedString(p.Object, "status", "phase")
+		if data.status == "" {
+			data.status = "Unknown"
+		}
+
+		// Get container statuses for ready count and restarts
+		containerStatuses, found, _ := unstructured.NestedSlice(p.Object, "status", "containerStatuses")
+		readyCount := 0
+		totalRestarts := int64(0)
+		totalContainers := 0
+
+		if found && len(containerStatuses) > 0 {
+			totalContainers = len(containerStatuses)
+			for _, cs := range containerStatuses {
+				if csMap, ok := cs.(map[string]interface{}); ok {
+					if ready, ok, _ := unstructured.NestedBool(csMap, "ready"); ok && ready {
+						readyCount++
+					}
+					if restartCount, ok, _ := unstructured.NestedInt64(csMap, "restartCount"); ok {
+						totalRestarts += restartCount
+					}
+				}
+			}
+		}
+
+		// Fallback to spec.containers count if no containerStatuses
+		if totalContainers == 0 {
+			if containers, found, _ := unstructured.NestedSlice(p.Object, "spec", "containers"); found {
+				totalContainers = len(containers)
+			}
+		}
+
+		data.ready = fmt.Sprintf("%d/%d", readyCount, totalContainers)
+		data.restarts = fmt.Sprintf("%d", totalRestarts)
+
+		// Get age from creationTimestamp
+		if creationTimestamp, found, _ := unstructured.NestedString(p.Object, "metadata", "creationTimestamp"); found && creationTimestamp != "" {
+			if t, err := time.Parse(time.RFC3339, creationTimestamp); err == nil {
+				data.age = formatAge(t)
+			} else {
+				data.age = "<unknown>"
+			}
+		} else {
+			data.age = "<unknown>"
+		}
+
+		if wide {
+			data.node, _, _ = unstructured.NestedString(p.Object, "spec", "nodeName")
+			if data.node == "" {
+				data.node = "<none>"
+			}
+			data.ip, _, _ = unstructured.NestedString(p.Object, "status", "podIP")
+			if data.ip == "" {
+				data.ip = "<none>"
+			}
+			data.nominated = "<none>"
+		}
+
+		if showLabels {
+			labels, _, _ := unstructured.NestedStringMap(p.Object, "metadata", "labels")
+			labelPairs := make([]string, 0, len(labels))
+			for k, v := range labels {
+				labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", k, v))
+			}
+			data.labels = strings.Join(labelPairs, ",")
+			if data.labels == "" {
+				data.labels = "<none>"
+			}
+		}
+
+		podList = append(podList, data)
+
+		// Update widths
+		if len(data.namespace) > widths["namespace"] {
+			widths["namespace"] = len(data.namespace)
+		}
+		if len(data.name) > widths["name"] {
+			widths["name"] = len(data.name)
+		}
+		if len(data.ready) > widths["ready"] {
+			widths["ready"] = len(data.ready)
+		}
+		if len(data.status) > widths["status"] {
+			widths["status"] = len(data.status)
+		}
+		if len(data.restarts) > widths["restarts"] {
+			widths["restarts"] = len(data.restarts)
+		}
+		if len(data.age) > widths["age"] {
+			widths["age"] = len(data.age)
+		}
+		if wide {
+			if len(data.node) > widths["node"] {
+				widths["node"] = len(data.node)
+			}
+			if len(data.ip) > widths["ip"] {
+				widths["ip"] = len(data.ip)
+			}
+			if len(data.nominated) > widths["nominated"] {
+				widths["nominated"] = len(data.nominated)
+			}
+		}
+		if showLabels {
+			if len(data.labels) > widths["labels"] {
+				widths["labels"] = len(data.labels)
+			}
+		}
+	}
+
+	// Build format string
+	var formatParts []string
+	var headerParts []string
+
+	if allNamespaces {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["namespace"]))
+		headerParts = append(headerParts, "NAMESPACE")
+	}
+
+	formatParts = append(formatParts,
+		fmt.Sprintf("%%-%ds", widths["name"]),
+		fmt.Sprintf("%%-%ds", widths["ready"]),
+		fmt.Sprintf("%%-%ds", widths["status"]),
+		fmt.Sprintf("%%-%ds", widths["restarts"]),
+		fmt.Sprintf("%%-%ds", widths["age"]))
+	headerParts = append(headerParts, "NAME", "READY", "STATUS", "RESTARTS", "AGE")
+
+	if wide {
+		formatParts = append(formatParts,
+			fmt.Sprintf("%%-%ds", widths["ip"]),
+			fmt.Sprintf("%%-%ds", widths["node"]),
+			fmt.Sprintf("%%-%ds", widths["nominated"]))
+		headerParts = append(headerParts, "IP", "NODE", "NOMINATED NODE")
+	}
+
+	if showLabels {
+		formatParts = append(formatParts, fmt.Sprintf("%%-%ds", widths["labels"]))
+		headerParts = append(headerParts, "LABELS")
+	}
+
+	dataFormat := strings.Join(formatParts, "   ") + "\n"
+
+	// Print header
+	fmt.Fprintf(out, dataFormat, toInterfaceSlice(headerParts)...)
+
+	// Print each pod
+	for _, data := range podList {
+		var rowParts []interface{}
+		if allNamespaces {
+			rowParts = append(rowParts, data.namespace)
+		}
+		rowParts = append(rowParts, data.name, data.ready, data.status, data.restarts, data.age)
+		if wide {
+			rowParts = append(rowParts, data.ip, data.node, data.nominated)
+		}
+		if showLabels {
+			rowParts = append(rowParts, data.labels)
+		}
+		fmt.Fprintf(out, dataFormat, rowParts...)
+	}
+
+	return nil
+}
 
 func printPodsTable(items []runtime.Object, out io.Writer, allNamespaces bool, showLabels bool, wide bool) error {
 	type podData struct {

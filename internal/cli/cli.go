@@ -74,26 +74,109 @@ func (c *CLI) configure() {
 		return nil
 	}
 
-	c.root.AddCommand(
-		newSSHCommand(),
-		newClusterCommand(),
-		newNodeCommand(),
-		newMCPCommand(),
-		newBindingCommand(),
-		newProjectCommand(),
+	// Define command groups
+	c.root.AddGroup(
+		&cobra.Group{ID: "basic", Title: "Basic Commands:"},
+		&cobra.Group{ID: "deploy", Title: "Deploy Commands:"},
+		&cobra.Group{ID: "troubleshoot", Title: "Troubleshooting & Debugging:"},
+		&cobra.Group{ID: "cluster", Title: "Cluster Management:"},
+		&cobra.Group{ID: "security", Title: "Security & Certificates:"},
+		&cobra.Group{ID: "node", Title: "Node Operations:"},
+		&cobra.Group{ID: "settings", Title: "Settings & Configuration:"},
+	)
+
+	// Helper to set group on commands
+	addWithGroup := func(groupID string, cmds ...*cobra.Command) {
+		for _, cmd := range cmds {
+			cmd.GroupID = groupID
+			c.root.AddCommand(cmd)
+		}
+	}
+
+	// Basic Commands — viewing and interacting with resources
+	addWithGroup("basic",
 		newGetCommand(),
-		newCreateCommand(),
-		newEditCommand(),
-		newDeleteCommand(),
 		newDescribeCommand(),
 		newLogsCommand(),
+		newExecCommand(),
+		newRshCommand(),
+		newCpCommand(),
+		newAttachCommand(),
+		newPortForwardCommand(),
+		newEventsCommand(),
+		newTopCommand(),
+		newStatusCommand(),
+		newExplainCommand(),
+		newWhoamiCommand(),
+		newProjectCommand(),
+		newProjectsCommand(),
+		newNewProjectCommand(),
+	)
+
+	// Deploy Commands — creating, modifying, and managing resources
+	addWithGroup("deploy",
+		newCreateCommand(),
 		newApplyCommand(),
+		newEditCommand(),
+		newDeleteCommand(),
 		newPatchCommand(),
 		newAnnotateCommand(),
 		newLabelCommand(),
-		newClearYMLCommand(),
+		newScaleCommand(),
+		newAutoscaleCommand(),
+		newRolloutCommand(),
+		newExposeCommand(),
+		newRunCommand(),
+		newSetCommand(),
+		newReplaceCommand(),
+		newDiffCommand(),
+		newWaitCommand(),
+		newStartBuildCommand(),
+	)
+
+	// Troubleshooting & Debugging
+	addWithGroup("troubleshoot",
+		newFailedCommand(),
+		newRestartReportCommand(),
+		newCapacityCommand(),
+		newDrainStatusCommand(),
 		newDiagnoseCommand(),
-		newTopCommand(),
+		newDebugCommand(),
+		newClearYMLCommand(),
+		newExtractCommand(),
+	)
+
+	// Cluster Management
+	addWithGroup("cluster",
+		newClusterCommand(),
+		newUpgradeCommand(),
+		newMCPCommand(),
+		newBindingCommand(),
+		newEtcdHealthCommand(),
+		newAPIResourcesCommand(),
+		newAPIVersionsCommand(),
+		newProxyCommand(),
+	)
+
+	// Security & Certificates
+	addWithGroup("security",
+		newCertsCommand(),
+		newAuthCommand(),
+		newLoginCommand(),
+		newLogoutCommand(),
+		newGetTokenCommand(),
+	)
+
+	// Node Operations
+	addWithGroup("node",
+		newNodeCommand(),
+		newSSHCommand(),
+	)
+
+	// Settings & Configuration
+	addWithGroup("settings",
+		newConfigCommand(),
+		newContextCommand(),
 		newVersionCommand(),
 		newCompletionCommand(c.root),
 	)

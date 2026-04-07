@@ -34,6 +34,9 @@ func newNodeCommand() *cobra.Command {
 		newNodeDrainCommand(),
 		newNodeUncordonCommand(),
 		newNodeGetPodsCommand(),
+		newNodeJournalCommand(),
+		newNodeResourcesCommand(),
+		newNodeCompareCommand(),
 	)
 
 	return cmd

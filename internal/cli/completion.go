@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/liadyahav/ocp-cli/internal/kube"
 )
@@ -210,4 +211,48 @@ func filterCompletions(items []string, prefix string) []string {
 		}
 	}
 	return completions
+}
+
+// completeContextNames returns context names from kubeconfig for completion
+func completeContextNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{}).RawConfig()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	completions := make([]string, 0, len(config.Contexts))
+	for name := range config.Contexts {
+		if strings.HasPrefix(name, toComplete) {
+			completions = append(completions, name)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+// completeContainerNames returns container names for a pod for completion
+func completeContainerNames(cmd *cobra.Command, namespace string, podName string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	clientset, err := kube.NewClientset(ctx)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	ns := resolveNamespace(ctx, namespace, false)
+	pod, err := clientset.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+
+	completions := make([]string, 0, len(pod.Spec.Containers))
+	for _, c := range pod.Spec.Containers {
+		if strings.HasPrefix(c.Name, toComplete) {
+			completions = append(completions, c.Name)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }
